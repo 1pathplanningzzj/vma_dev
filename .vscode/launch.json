@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Train VMA Trunk Line Task",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/tools/train.py",
+            "args": ["projects/configs/vma_trunk_line_two_map_res_later_fusion_att_gram_loss.py"],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}:${env:PYTHONPATH}",
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "pythonPath": "/root/miniconda3/envs/vma/bin/python",
+            // 
+            "debugOptions": [
+                "DebugPyPath=/root/miniconda3/envs/vma/lib/python3.8/site-packages/debugpy"
+            ]
+        }
+    ]
+}
