@@ -269,10 +269,18 @@ class VMAHead(DETRHead):
                 feat_view_smoothed = self.high_res_smoothing(feat_view)
                 
                 B, C, H, W = feat_lidar.shape
+
+                # 生成Mask：基于LiDAR特征响应强度（筛选有信心的区域）
+                with torch.no_grad():
+                    # 计算L2范数作为激活强度
+                    lidar_magnitude = torch.norm(feat_lidar, p=2, dim=1)  # [B, H, W]
+                    # 过滤掉极小值的背景噪声区域
+                    mask = (lidar_magnitude > 1e-3).float().reshape(B, -1)  # [B, N]
+
                 feat_lidar_reshaped = feat_lidar.permute(0, 2, 3, 1).reshape(bs, -1, 256)
                 feat_view_reshaped = feat_view_smoothed.permute(0, 2, 3, 1).reshape(bs, -1, 256)
                 # 仅让view向lidar对齐，避免lidar被噪声污染
-                gram_loss += self.gram_loss(feat_view_reshaped, feat_lidar_reshaped, spatial_shape=(H, W))
+                gram_loss += self.gram_loss(feat_view_reshaped, feat_lidar_reshaped.detach(), mask=mask, spatial_shape=(H, W))
                 # gram_loss = 0  
 
                 # 计算GramLoss（让主分支模仿View分支的关联模式，双向对齐）
