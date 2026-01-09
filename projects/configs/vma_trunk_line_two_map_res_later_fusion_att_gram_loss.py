@@ -11,7 +11,7 @@ log_config = dict(
 # yapf:enable
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = "./new_data_train_result/new_data_categary_split_dataset_pt25_no_gram_loss"
+work_dir = "/homes/zhangzijian/vma_dev/train_result_/mapTR_lidar_res101/"
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
@@ -128,8 +128,7 @@ input_modality = dict(
     use_z_map=False, # npy file should be customed specially
 )
 # img_keys=["lidar_map"]
-
-img_keys =["lidar_map", "view_map"]
+img_keys =["lidar_map", "view_map"] # 加回 "view_map"
 # img_keys =["lidar_map", "view_map", "z_map"]
 
 model = dict(
@@ -278,6 +277,7 @@ model = dict(
         loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.01), # 方向损失加大一点
         loss_offset=dict(type='LateralOffsetLoss',loss_weight=3.5),
         # loss_slope=dict(type='MSELoss', loss_weight=0.5), # 增加 斜率损失进行测试 
+        gram_loss_weight=0.0,
 ),
     # model training and testing settings
     train_cfg=dict(pts=dict(
@@ -425,7 +425,6 @@ data = dict(
                 map_classes=map_classes,
                 attrs_dict=attrs_dict, 
                 eval_use_same_gt_sample_num_flag=eval_use_same_gt_sample_num_flag,
-                # 新增：传递动态采样配置到数据集
                 dynamic_sample_config=dynamic_sample_config,
                 pipeline=train_pipeline,
                 mode='train',
@@ -497,9 +496,9 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
  
-total_epochs = 200
+total_epochs = 50
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-checkpoint_config = dict(interval=8)
+checkpoint_config = dict(interval=50)
 
-evaluation = dict(interval=4, metric='chamfer')
-# fp16 = dict(loss_scale=512.)
+evaluation = dict(interval=2, metric='chamfer')
+# fp16 = dict(loss_scale=512.) 
