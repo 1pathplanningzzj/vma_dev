@@ -19,41 +19,41 @@ class VMAHead(DETRHead):
 
     def __init__(self,
                  *args,
-                 with_box_refine=False, 
-                 as_two_stage=False,    
-                 transformer=None,   
-                 bbox_coder=None,
-                 num_cls_fcs=2,
-                 num_vec=20,           
-                 num_pts_per_vec=2,    
-                 num_pts_per_gt_vec=2, 
-                 query_embed_type='all_pts',
-                 transform_method='minmax',
-                 gt_shift_pts_pattern='v0',
-                 dir_interval=1,
+                 with_box_refine=False,  # 是否使用box refinement
+                 as_two_stage=False,    # 是否为两阶段检测
+                 transformer=None,     # Transformer模块
+                 bbox_coder=None,      # 边界框编码器
+                 num_cls_fcs=2,        # 分类全连接层数量
+                 num_vec=20,           # 向量数量
+                 num_pts_per_vec=2,    # 每个向量包含的点数
+                 num_pts_per_gt_vec=2, # 每个GT向量包含的点数
+                 query_embed_type='all_pts',  # 查询嵌入类型
+                 transform_method='minmax',   # 点变换方法
+                 gt_shift_pts_pattern='v0',   # GT点偏移模式
+                 dir_interval=1,        # 方向间隔
                  # View分支参数
-                 view_embed_dims=256,   # 必须=主分支embed_dims
-                 view_num_heads=8,      # 需整除view_embed_dims
-                 view_ffn_channels=1024,
+                 view_embed_dims=256,   # View分支嵌入维度，需等于主分支
+                 view_num_heads=8,      # View分支注意力头数，需整除embed_dims
+                 view_ffn_channels=1024,  # View分支FFN通道数
                  # 损失函数
-                 loss_pts2lines=dict(type='ChamferDistance', loss_src_weight=1.0, loss_dst_weight=1.0),
-                 loss_pts2pts=dict(type='ChamferDistance', loss_src_weight=1.0, loss_dst_weight=1.0),
-                 loss_dir=dict(type='PtsDirCosLoss', loss_weight=2.0),
-                 loss_attr=dict(type='FocalLoss', use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=2.0),
-                 loss_offset=None,
-                 gram_loss = dict(
-                    type = 'GramLoss',
-                    apply_norm = True,
-                    img_level = True,
-                    remove_neg = True,
-                    window_size = 3 
+                 loss_pts2lines=dict(type='ChamferDistance', loss_src_weight=1.0, loss_dst_weight=1.0),  # 点到线距离损失
+                 loss_pts2pts=dict(type='ChamferDistance', loss_src_weight=1.0, loss_dst_weight=1.0),    # 点到点距离损失
+                 loss_dir=dict(type='PtsDirCosLoss', loss_weight=2.0),  # 方向余弦损失
+                 loss_attr=dict(type='FocalLoss', use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=2.0),  # 属性分类损失
+                 loss_offset=None,     # 偏移损失
+                 gram_loss=dict(        # Gram矩阵损失
+                    type='GramLoss',
+                    apply_norm=True,
+                    img_level=True,
+                    remove_neg=True,
+                    window_size=3
                  ),
-                gram_loss_weight=1.0,  # GramLoss权重
+                 gram_loss_weight=1.0,  # Gram损失权重
                  **kwargs):
 
         self.fp16_enabled = False
 
-        # 基础参数初始化（不变）
+        # 基础参数初始化
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
         if self.as_two_stage and transformer is not None:
@@ -72,12 +72,10 @@ class VMAHead(DETRHead):
         self.dir_interval = dir_interval
         self.attr_head_cfg = kwargs.get('attr_head', None)
 
-        # View分支参数（关键：与主分支embed_dims对齐）
+        # View分支参数（需与主分支embed_dims对齐）
         self.view_embed_dims = view_embed_dims
         self.view_num_heads = view_num_heads
         self.view_ffn_channels = view_ffn_channels
-
-
 
         # 父类初始化（获取self.embed_dims）
         super(VMAHead, self).__init__(*args, transformer=transformer, **kwargs)
@@ -86,6 +84,7 @@ class VMAHead(DETRHead):
         assert self.view_embed_dims == self.embed_dims, \
             f"View维度{self.view_embed_dims}需等于主分支{self.embed_dims}"
             
+        # 空间注意力融合模块：融合主分支和View分支特征
         self.spatial_attn_fusion = nn.Sequential(
             nn.Conv2d(256*2, 128, kernel_size=3, padding=1),  # 输入：两个256通道特征拼接（512通道）
             nn.ReLU(inplace=True),
@@ -94,7 +93,7 @@ class VMAHead(DETRHead):
         )            
         self._init_layers()
 
-        # 初始化View分支组件
+        # 初始化View分支注意力层
         self._init_view_attn_layers()
 
         # 损失函数初始化
@@ -104,7 +103,7 @@ class VMAHead(DETRHead):
         self.loss_attr = build_loss(loss_attr)
         self.loss_offset = build_loss(loss_offset) if loss_offset is not None else None
         self.gram_loss_weight = gram_loss_weight
-        self.gram_loss = build_loss(gram_loss)  # 构建GramLoss
+        self.gram_loss = build_loss(gram_loss)  # 构建Gram损失
         # 重新初始化Query嵌入（确保与num_query匹配）
         self._init_query_embedding()
 
@@ -261,15 +260,21 @@ class VMAHead(DETRHead):
         bs = mlvl_feats[0].shape[0]
         dtype = mlvl_feats[0].dtype
         gram_loss = 0.0 
+        mlvl_feats_view_processed = None
         if mlvl_feats_view is not None:
             assert len(mlvl_feats) == len(mlvl_feats_view), "两个特征的尺度数量必须一致"
-            mlvl_feats_fused = []
+            mlvl_feats_view_processed = []
             for feat_lidar, feat_view in zip(mlvl_feats, mlvl_feats_view):
-                # 1. 拼接当前尺度的两个特征（通道维度：256+256=512）
+                B, C, H, W = feat_lidar.shape
+                
+                # 1. 强制对齐 View 特征尺寸到 Lidar 特征尺寸 (H, W)
+                # 使用双线性插值确保尺寸完全一致，防止 Decoder 采样错位
+                if feat_view.shape[-2:] != (H, W):
+                    feat_view = F.interpolate(feat_view, size=(H, W), mode='bilinear', align_corners=False)
+
+                # 2. 特征平滑 (保留原有高分辨率平滑逻辑，应用在已对齐特征上)
                 feat_view_smoothed = self.high_res_smoothing(feat_view)
                 
-                B, C, H, W = feat_lidar.shape
-
                 # 生成Mask：基于LiDAR特征响应强度（筛选有信心的区域）
                 with torch.no_grad():
                     # 计算L2范数作为激活强度
@@ -281,23 +286,9 @@ class VMAHead(DETRHead):
                 feat_view_reshaped = feat_view_smoothed.permute(0, 2, 3, 1).reshape(bs, -1, 256)
                 # 仅让view向lidar对齐，避免lidar被噪声污染
                 gram_loss += self.gram_loss(feat_view_reshaped, feat_lidar_reshaped.detach(), mask=mask, spatial_shape=(H, W))
-                # gram_loss = 0  
-
-                # 计算GramLoss（让主分支模仿View分支的关联模式，双向对齐）
-
-                concat_feat = torch.cat([feat_lidar, feat_view_smoothed], dim=1)  # [bs, 512, H, W]
-                # 2. 计算逐像素权重（[bs, 2, H, W]：第0维=点云权重，第1维=图像权重）
-                attn_weights = self.spatial_attn_fusion(concat_feat)
                 
-                attn_weights = attn_weights * torch.tensor([0.7, 0.3], device=attn_weights.device).reshape(1, 2, 1, 1)
-
-                attn_weights = F.softmax(attn_weights, dim=1)  # 重新归一化
-                # 3. 加权融合（每个像素取两个特征的加权和）
-
-                fused = attn_weights[:, 0:1] * feat_lidar + attn_weights[:, 1:2] * feat_view_smoothed  # [bs, 256, H, W]
-                mlvl_feats_fused.append(fused)
-            # 用融合后的特征替换原mlvl_feats，后续流程不变
-            mlvl_feats = mlvl_feats_fused
+                mlvl_feats_view_processed.append(feat_view_smoothed)
+            
             gram_loss = gram_loss / len(mlvl_feats) * self.gram_loss_weight  #  gramloss的尝试
     #=================================================================================================================11.08 sota模型 
     # @force_fp32(apply_to=('mlvl_feats', 'mlvl_feats_view'))
@@ -395,6 +386,7 @@ class VMAHead(DETRHead):
         # -------------------------- 5. 调用Transformer（输入适配后的Query） --------------------------    
         outputs = self.transformer(
             mlvl_feats=mlvl_feats,
+            mlvl_feats_view=mlvl_feats_view_processed,
             mlvl_masks=mlvl_masks,
             query_embed=object_query_embeds,  # 传入转置后的Query
             mlvl_pos_embeds=mlvl_positional_encodings,
@@ -538,110 +530,6 @@ class VMAHead(DETRHead):
         return (labels_list, label_weights_list, pts_targets_list, pts_weights_list,assigned_attrs_labels_list, pos_attrs_pred_list, 
                 num_total_pos, num_total_neg)
 
-
-    # def loss_single(self,
-    #                 cls_scores,
-    #                 pts_preds,
-    #                 attrs_preds,
-    #                 gt_labels_list,
-    #                 gt_attr_list,
-    #                 gt_shifts_pts_list,
-    #                 ):
-        
-    #     # num_imgs = cls_scores.size(0)
-    #     num_imgs = pts_preds.size(0)
-    #     cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
-    #     pts_preds_list = [pts_preds[i] for i in range(num_imgs)]
-        
-    #     if attrs_preds is not None:
-    #         attr_preds_list = []
-    #         num_attrs = len(attrs_preds)
-    #         for i in range(num_imgs):
-    #             attr_preds_list.append([attrs_preds[j][i] for j in range(num_attrs)])
-    #     else:
-    #         attr_preds_list = [None for _ in range(num_imgs)]
-    #         gt_attr_list = [None for _ in range(num_imgs)]
-    #     cls_reg_targets = self.get_targets(cls_scores_list, pts_preds_list, attr_preds_list, gt_labels_list, gt_shifts_pts_list, gt_attr_list)
-    #     (labels_list, label_weights_list, pts_targets_list, pts_weights_list, assigned_attrs_labels_list, pos_attrs_pred_list, num_total_pos, num_total_neg) = cls_reg_targets
-        
-    #     labels = torch.cat(labels_list, 0)
-    #     label_weights = torch.cat(label_weights_list, 0)
-        
-    #     pts_targets = torch.cat(pts_targets_list, 0)
-    #     pts_weights = torch.cat(pts_weights_list, 0)
-        
-    #     # classification loss
-    #     cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
-    #     # construct weighted avg_factor to match with the official DETR repo
-    #     cls_avg_factor = num_total_pos * 1.0 + \
-    #         num_total_neg * self.bg_cls_weight
-    #     if self.sync_cls_avg_factor:
-    #         cls_avg_factor = reduce_mean(
-    #             cls_scores.new_tensor([cls_avg_factor]))
-    #     cls_avg_factor = max(cls_avg_factor, 1)
-    #     loss_cls = self.loss_cls(
-    #         cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
-        
-    #     if attrs_preds is not None:
-    #         assigned_attrs_labels = []
-    #         pos_attrs_preds = []
-    #         for i in range(num_attrs):
-    #             assigned_attrs_labels.append(torch.cat([assigned_attrs_labels_list[j][i] for j in range(num_imgs)], 0))
-    #             pos_attrs_preds.append(torch.cat([pos_attrs_pred_list[j][i] for j in range(num_imgs)], 0))
-    #         loss_attr=torch.tensor([0.0], device = torch.device('cuda'))
-    #         for assigned_attr_labels, pos_attr_preds in zip(assigned_attrs_labels, pos_attrs_preds):
-    #             attr_label_weights = assigned_attr_labels.new_ones(assigned_attr_labels.shape, dtype=torch.long)
-    #             loss_attr += self.loss_attr(
-    #                 pos_attr_preds, assigned_attr_labels, attr_label_weights, avg_factor=cls_avg_factor)
-    #     else:
-    #         loss_attr = None
-        
-        
-    #     # Compute the average number of gt boxes accross all gpus, for
-    #     # normalization purposes
-    #     num_total_pos = loss_cls.new_tensor([num_total_pos])
-    #     num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
-      
-    #     normalized_pts_targets = pts_targets 
-    #     # num_samples, num_pts, num_coords
-    #     pts_preds = pts_preds.reshape(-1, pts_preds.size(-2),pts_preds.size(-1))
-    #     if self.num_pts_per_vec != self.num_pts_per_gt_vec:
-    #         pts_preds = pts_preds.permute(0,2,1)
-    #         pts_preds = F.interpolate(pts_preds, size=(self.num_pts_per_gt_vec), mode='linear',
-    #                                 align_corners=True)
-    #         pts_preds = pts_preds.permute(0,2,1).contiguous()
-
-    #     loss_pts2lines = self.loss_pts2lines(
-    #         pts_preds, 
-    #         normalized_pts_targets, 
-    #         pts_weights,
-    #         avg_factor=num_total_pos)
-    #     loss_pts2pts = self.loss_pts2pts(
-    #         pts_preds, 
-    #         normalized_pts_targets, 
-    #         pts_weights,
-    #         avg_factor=num_total_pos)
-    #     dir_weights = pts_weights[:, :-self.dir_interval,0]
-    #     denormed_pts_preds = pts_preds
-    #     denormed_pts_preds_dir = denormed_pts_preds[:,self.dir_interval:,:] - denormed_pts_preds[:,:-self.dir_interval,:]
-    #     pts_targets_dir = pts_targets[:, self.dir_interval:,:] - pts_targets[:,:-self.dir_interval,:]
-        
-    #     loss_dir = self.loss_dir(
-    #         denormed_pts_preds_dir, 
-    #         pts_targets_dir,
-    #         dir_weights,
-    #         avg_factor=num_total_pos)
-    #     if self.loss_offset is not None:
-    #         loss_offset=self.loss_offset(pts_preds,normalized_pts_targets,denormed_pts_preds_dir,pts_targets_dir,self.dir_interval,weight1=dir_weights,weight2=pts_weights[:, :,0],avg_factor=num_total_pos)
-    #     else:
-    #         loss_offset=0
-    #     if digit_version(TORCH_VERSION) >= digit_version('1.8'):
-    #         loss_cls = torch.nan_to_num(loss_cls)
-    #         loss_pts2lines = torch.nan_to_num(loss_pts2lines)
-    #         loss_pts2pts = torch.nan_to_num(loss_pts2pts)
-    #         loss_dir = torch.nan_to_num(loss_dir)
-    #         loss_offset = torch.nan_to_num(loss_offset)
-    #     return loss_cls, loss_pts2lines, loss_pts2pts, loss_dir, loss_attr, loss_offset
     def loss_single(self,
                     cls_scores,
                     pts_preds,

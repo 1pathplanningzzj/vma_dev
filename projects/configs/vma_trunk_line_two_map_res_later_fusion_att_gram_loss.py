@@ -11,7 +11,7 @@ log_config = dict(
 # yapf:enable
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = "/homes/zhangzijian/vma_dev/train_result_/mapTR_lidar_swinB_view_res101_spatial_fusion_gram_loss_0/"
+work_dir = "/homes/zhangzijian/vma_dev/train_result_/mapTR_lidar_swinB_view_res34_crossattn_gram_loss_0/"
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
@@ -164,14 +164,14 @@ model = dict(
 
     img_backbone_view=dict(
         type='ResNet',
-        depth=101, 
+        depth=34, 
         num_stages=4,
         out_indices=(1,2,3,),
         frozen_stages=1,
         norm_cfg=dict(type='BN', requires_grad=False),
         norm_eval=True,
         style='pytorch',
-        pretrained='/homes/zhangzijian/vma-dev/ckpts/resnet101-5d3b4d8f.pth'
+        pretrained='/homes/zhangzijian/vma-dev/ckpts/resnet34-333f7ec4.pth'
         ),
 
     img_neck=dict(
@@ -185,7 +185,7 @@ model = dict(
 
     img_neck_view=dict(
         type='ChannelMapper',
-        in_channels=[512, 1024, 2048],          
+        in_channels=[128, 256, 512],          
         kernel_size=1,
         out_channels=256,
         act_cfg=None,
@@ -210,7 +210,7 @@ model = dict(
         code_size=2,
         code_weights=[1.0, 1.0, 1.0, 1.0],
         transformer=dict(
-            type='DeformableDetrTransformer',
+            type='SplitModalityTransformer',
             encoder=dict(
                 type='DetrTransformerEncoder',
                 num_layers=6,
@@ -222,7 +222,8 @@ model = dict(
                     ffn_dropout=0.1,
                     operation_order=('self_attn', 'norm', 'ffn', 'norm'))),
             decoder=dict(
-                type='VMADetectionTransformerDecoder',
+                type='SplitModalityDecoder',
+                split_layer_index=3,
                 num_layers=6,
                 return_intermediate=True,
                 transformerlayers=dict(
@@ -315,13 +316,13 @@ model = dict(
 dataset_type = 'TrunkLineDataset'
 # 定义多个数据根目录
 data_root1 = dict(
-    train="/homes/zhangzijian/vma-dev/data_1209_merged_split/train/",
+    train="/homes/zhangzijian/vma-dev/data_1209_merged_split/val/",
     val="/homes/zhangzijian/vma-dev/data_1209_merged_split/val/",
     test="/homes/zhangzijian/vma-dev/data_1209_merged_split/test/",
 )
 # 新增第二个数据根目录（new_data）
 data_root2 = dict(
-    train="/homes/zhangzijian/vma-dev/new_data/",  # 根据实际目录结构调整
+    train="/homes/zhangzijian/vma-dev/new_data_val/",  # 根据实际目录结构调整
     val="/homes/zhangzijian/vma-dev/new_data_val/",      # 根据实际目录结构调整
     test="/homes/zhangzijian/vma-dev/new_data_val/",    # 根据实际目录结构调整
 )
