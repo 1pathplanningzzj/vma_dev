@@ -11,7 +11,7 @@ log_config = dict(
 # yapf:enable
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = "/homes/zhangzijian/vma_dev/train_result_/mapTR_lidar_res101/"
+work_dir = "/homes/zhangzijian/vma_dev/train_result_/mapTR_lidar_swinB_view_res101_spatial_fusion_gram_loss_0/"
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
@@ -122,6 +122,7 @@ task_config = dict(
     with_view=True,
     with_z=False,
 )
+
 input_modality = dict(
     use_lidar_map=True,
     use_view_map=True,
@@ -140,15 +141,25 @@ model = dict(
     pretrained = None,
 
     img_backbone=dict(
-        type='ResNet',
-        depth=101, 
-        num_stages=4,
-        out_indices=(1,2,3,),
+        type='SwinTransformer',
+        pretrained='/homes/zhangzijian/vma-dev/ckpts/swin_base_patch4_window7_224_22kto1k.pth',
+        embed_dims=128,
+        depths=[2, 2, 18, 2],
+        num_heads=[4, 8, 16, 32],
+        window_size=7,
+        mlp_ratio=4,
+        qkv_bias=True,
+        drop_rate=0.1,
+        attn_drop_rate=0.1,
+        drop_path_rate=0.2,
+        patch_norm=True,
+        out_indices=(1, 2, 3),
         frozen_stages=1,
-        norm_cfg=dict(type='BN', requires_grad=False),
-        norm_eval=True,
-        style='pytorch',
-        pretrained='/homes/zhangzijian/vma-dev/ckpts/resnet101-5d3b4d8f.pth'
+        norm_cfg=dict(type='LN', requires_grad=True),
+        use_abs_pos_embed=False,
+        with_cp=False,
+        init_cfg=dict(type='Pretrained', checkpoint='ckpts/swin_base_patch4_window7_224_22kto1k.pth'),
+        act_cfg=dict(type='GELU'),
     ),
 
     img_backbone_view=dict(
@@ -165,7 +176,7 @@ model = dict(
 
     img_neck=dict(
         type='ChannelMapper',
-        in_channels=[512, 1024, 2048],          
+        in_channels=[256, 512, 1024],          
         kernel_size=1,
         out_channels=256,
         act_cfg=None,
