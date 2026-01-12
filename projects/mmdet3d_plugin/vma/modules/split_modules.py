@@ -3,6 +3,7 @@ import torch.nn as nn
 from mmdet.models.utils.builder import TRANSFORMER
 from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
 from mmdet.models.utils.transformer import DeformableDetrTransformer, inverse_sigmoid
+from mmcv.cnn.bricks.transformer import build_transformer_layer_sequence
 from .decoder import VMADetectionTransformerDecoder
 
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
@@ -12,6 +13,7 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         self.split_layer_index = split_layer_index
         self.use_gating = use_gating
         self.use_gradual = use_gradual
+        # self.test = False
         
         # Gating module: Learn to filter view features based on lidar features
         if self.use_gating:
@@ -126,6 +128,13 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
 
 @TRANSFORMER.register_module()
 class SplitModalityTransformer(DeformableDetrTransformer):
+    def __init__(self, *args, encoder_view=None, **kwargs):
+        super(SplitModalityTransformer, self).__init__(*args, **kwargs)
+        if encoder_view is not None:
+            self.encoder_view = build_transformer_layer_sequence(encoder_view)
+        else:
+            self.encoder_view = None
+
     def forward(self,
                 mlvl_feats,
                 mlvl_masks,
@@ -202,10 +211,36 @@ class SplitModalityTransformer(DeformableDetrTransformer):
             for lvl, feat in enumerate(mlvl_feats_view):
                 # Assume alignment with Lidar
                 feat = feat.flatten(2).transpose(1, 2)
-                if self.num_feature_levels > 1:
-                    feat = feat + self.level_embeds[lvl].view(1, 1, -1).to(feat.dtype)
+                # Note: We reuse the same level embeddings logic, but applied to view features
+                # lvl_pos_embed is already calculated above and matches if shapes match
+                
+                # However, for the encoder input, we generally want the feature + level_embed (sometimes)
+                # But DeformableDetrTransformerEncoder usually takes 'query' (feature) and 'query_pos' (pos + lvl)
+                # In the loop above `lvl_pos_embed` = `pos_embed` + `level_embed`.
+                # We can reuse `lvl_pos_embed_flatten` because spatial shapes are the same.
+                
                 feat_flatten_view.append(feat)
-            memory_view = torch.cat(feat_flatten_view, 1).permute(1, 0, 2)
+            
+            # Combine levels
+            feat_flatten_view = torch.cat(feat_flatten_view, 1) # (BS, Total_Len, C)
+            
+            # Pass through View Encoder if it exists
+            if self.encoder_view is not None:
+                # Reuse geometry info from Lidar branch since we enforced alignment
+                memory_view = self.encoder_view(
+                    query=feat_flatten_view.permute(1, 0, 2), # (Len, BS, C)
+                    key=None,
+                    value=None,
+                    query_pos=lvl_pos_embed_flatten.permute(1, 0, 2), # Reuse pos embeds
+                    query_key_padding_mask=mask_flatten,              # Reuse masks
+                    spatial_shapes=spatial_shapes,
+                    level_start_index=level_start_index,
+                    valid_ratios=valid_ratios,
+                    reference_points=reference_points,
+                    **kwargs
+                )
+            else:
+                memory_view = feat_flatten_view.permute(1, 0, 2)
 
         # --- 4. Decoder ---
         query_pos, query = torch.split(query_embed, self.embed_dims, dim=1)
