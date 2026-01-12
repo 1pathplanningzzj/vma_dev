@@ -7,9 +7,28 @@ from .decoder import VMADetectionTransformerDecoder
 
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
 class SplitModalityDecoder(VMADetectionTransformerDecoder):
-    def __init__(self, *args, split_layer_index=3, **kwargs):
+    def __init__(self, *args, split_layer_index=3, use_gating=True, use_gradual=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.split_layer_index = split_layer_index
+        self.use_gating = use_gating
+        self.use_gradual = use_gradual
+        
+        # Gating module: Learn to filter view features based on lidar features
+        if self.use_gating:
+            embed_dims = kwargs.get('embed_dims', 256)
+            self.gating_module = nn.Sequential(
+                nn.Linear(embed_dims * 2, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, embed_dims),
+                nn.Sigmoid()
+            )
+
+            # Initialize weights
+            for m in self.gating_module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
 
     def forward(self,
                 query,
@@ -28,11 +47,44 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         value_lidar = kwargs.get('value', None)
         
         for lid, layer in enumerate(self.layers):
-
-            # Logic to switch value based on layer index
             current_value = value_lidar
-            if lid >= self.split_layer_index and value_view is not None:
-                current_value = value_view
+
+            if value_view is not None:
+                # 1. Gating / Noise Filtering
+                # Gate view features using lidar features as context
+                refined_view = value_view
+                if self.use_gating and value_lidar is not None:
+                    # value_lidar: (BS, Num_Keys, C)
+                    # value_view: (BS, Num_Keys, C)
+                    # Concat along channel dimension
+                    cat_feat = torch.cat([value_lidar, value_view], dim=-1)
+                    gate = self.gating_module(cat_feat)
+                    refined_view = value_view * gate
+                
+                # 2. Gradual Fusion or Hard Split
+                if self.use_gradual:
+                    # Calculate weight: 0 at first layer, 1 at last layer
+                    num_layers = len(self.layers)
+                    # progress = lid / (num_layers - 1) if num_layers > 1 else 1.0 # Linear 0->1
+                    
+                    # Alternatively, start gradual transition AFTER split_layer_index?
+                    # Or simple transition across all layers as requested: "view weight 0->1"
+                    
+                    # Implementation: Linear transition scheme
+                    view_weight = float(lid) / float(num_layers - 1)
+                    view_weight = min(max(view_weight, 0.0), 1.0)
+                    lidar_weight = 1.0 - view_weight
+                    
+                    # Fused value
+                    if value_lidar is not None:
+                        current_value = lidar_weight * value_lidar + view_weight * refined_view
+                    else:
+                        current_value = refined_view
+                        
+                else:
+                    # Legacy Hard Split Logic
+                    if lid >= self.split_layer_index:
+                        current_value = refined_view
             
             # Update kwargs locally for this layer call
             kwargs['value'] = current_value
