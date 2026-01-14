@@ -1,5 +1,9 @@
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+import cv2  # 用于热力图平滑和缩放
 from mmdet.models.utils.builder import TRANSFORMER
 from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
 from mmdet.models.utils.transformer import DeformableDetrTransformer, inverse_sigmoid
@@ -14,6 +18,14 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         self.use_gating = use_gating
         self.use_gradual = use_gradual
         # self.test = False
+
+        # [DEBUG ADDITION]
+        self.debug_step = 0
+        self.debug_dir = "debug_vis_1/attention_check"
+        try:
+            os.makedirs(self.debug_dir, exist_ok=True)
+        except Exception:
+            pass
         
         # Gating module: Learn to filter view features based on lidar features
         if self.use_gating:
@@ -31,6 +43,113 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     nn.init.xavier_uniform_(m.weight)
                     if m.bias is not None:
                         nn.init.constant_(m.bias, 0)
+
+    # [DEBUG ADDITION]
+    def visualize_reference_points(self, reference_points, layer_idx, img_metas=None, feature_map=None, feature_map_view=None, spatial_shapes=None):
+        """
+        reference_points: (BS, Num_Query, 2)
+        feature_map: (BS, Len_Seq, C)  Lidar
+        feature_map_view: (BS, Len_Seq, C) View
+        spatial_shapes: (Num_Levels, 2)
+        """
+        # Save every 100 steps
+        if self.debug_step % 1000 != 0:
+            return
+
+        try:
+            # --- 1. Reference Points Heatmap ---
+            pts = reference_points[0].detach().cpu().numpy()
+            
+            # 使用高斯模糊生成热力图
+            img_h, img_w = 200, 200
+            heatmap = np.zeros((img_h, img_w), dtype=np.float32)
+            
+            px = (pts[:, 0] * img_w).astype(np.int32)
+            py = (pts[:, 1] * img_h).astype(np.int32)
+            
+            valid_mask = (px >= 0) & (px < img_w) & (py >= 0) & (py < img_h)
+            px = px[valid_mask]
+            py = py[valid_mask]
+            
+            for x, y in zip(px, py):
+                heatmap[y, x] += 1
+            
+            heatmap = cv2.GaussianBlur(heatmap, (15, 15), 0)
+            heatmap = heatmap / (heatmap.max() + 1e-9)
+            
+            # helper to process feature map
+            def process_feat(feat_map, s_shapes):
+                feat_img = None
+                status = ""
+                if feat_map is not None and s_shapes is not None:
+                    if feat_map.shape[1] != feat_map.shape[0] and feat_map.shape[0] > feat_map.shape[1]: 
+                         seq_dim = 0
+                    else:
+                         seq_dim = 1
+                    
+                    current_len = feat_map.shape[seq_dim]
+                    H, W = s_shapes[0].tolist()
+                    feat_len = H * W
+                    
+                    if current_len >= feat_len:
+                        if seq_dim == 0:
+                            feat = feat_map[:feat_len, 0, :].detach().cpu()
+                        else:
+                            feat = feat_map[0, :feat_len, :].detach().cpu()
+                        
+                        feat_norm = torch.norm(feat, dim=1).numpy()
+                        try:
+                            feat_img = feat_norm.reshape(H, W)
+                            feat_img = cv2.resize(feat_img, (img_w, img_h))
+                            # Normalize for better vis
+                            feat_img = (feat_img - feat_img.min()) / (feat_img.max() - feat_img.min() + 1e-9)
+                        except ValueError:
+                             status = "Reshape Fail"
+                    else:
+                        status = "Size Mismatch"
+                return feat_img, status
+
+            feat_img_lidar, status_lidar = process_feat(feature_map, spatial_shapes)
+            feat_img_view, status_view = process_feat(feature_map_view, spatial_shapes)
+
+            # --- Plotting ---
+            plt.figure(figsize=(18, 6))
+            
+            # Subplot 1: Ref Points Heatmap
+            plt.subplot(1, 3, 1)
+            plt.imshow(heatmap, cmap='jet', extent=[0, 1, 1, 0])
+            plt.title(f"Ref Points Density (L{layer_idx})")
+            plt.colorbar(fraction=0.046, pad=0.04)
+            
+            # Subplot 2: Lidar Feature Map
+            plt.subplot(1, 3, 2)
+            if feat_img_lidar is not None:
+                plt.imshow(feat_img_lidar, cmap='viridis', extent=[0, 1, 1, 0])
+                plt.imshow(heatmap, cmap='jet', alpha=0.3, extent=[0, 1, 1, 0]) 
+                plt.title("Lidar (Lvl 0) + Refs")
+            else:
+                plt.text(0.5, 0.5, status_lidar or "No Lidar", ha='center')
+                plt.title("Lidar Skipped")
+
+            # Subplot 3: View Feature Map
+            plt.subplot(1, 3, 3)
+            if feat_img_view is not None:
+                plt.imshow(feat_img_view, cmap='viridis', extent=[0, 1, 1, 0])
+                plt.imshow(heatmap, cmap='jet', alpha=0.3, extent=[0, 1, 1, 0]) 
+                plt.title("View (Lvl 0) + Refs")
+            else:
+                plt.text(0.5, 0.5, status_view or "No View", ha='center')
+                plt.title("View Skipped")
+                
+            plt.suptitle(f"Step {self.debug_step} Layer {layer_idx}")
+            plt.tight_layout()
+            
+            save_path = os.path.join(self.debug_dir, f"step_{self.debug_step}_layer_{layer_idx}_heatmap.png")
+            plt.savefig(save_path)
+            plt.close()
+            
+        except Exception as e:
+            print(f"Vis error: {e}")
 
     def forward(self,
                 query,
@@ -51,33 +170,54 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         for lid, layer in enumerate(self.layers):
             current_value = value_lidar
 
+            refined_view = None # 初始化 refined_view
             if value_view is not None:
                 # 1. Gating / Noise Filtering
-                # Gate view features using lidar features as context
                 refined_view = value_view
                 if self.use_gating and value_lidar is not None:
+                     # ... existing gating logig ...
                     # value_lidar: (BS, Num_Keys, C)
                     # value_view: (BS, Num_Keys, C)
                     # Concat along channel dimension
                     cat_feat = torch.cat([value_lidar, value_view], dim=-1)
                     gate = self.gating_module(cat_feat)
                     refined_view = value_view * gate
-                
+
+            # [DEBUG ADDITION]
+            if self.training:
+                 # Pass both Lidar (value_lidar) and View (refined_view OR value_view)
+                 # We prefer showing refined_view if gating is ON, to see what actually goes into fusion
+                 vis_view = refined_view if refined_view is not None else value_view
+                 self.visualize_reference_points(
+                     reference_points, 
+                     lid, 
+                     feature_map=kwargs.get('value', None), # This is usually 'current_value' from PREVIOUS layer logic? Wait, kwargs['value'] is updated at end of loop.
+                     # Actually 'value_lidar' is constant across layers as "Memory".
+                     # The decoder usually takes 'memory' as input. 
+                     # Let's visualize the RAW Inputs to this layer fusion.
+                     # Lidar = value_lidar
+                     feature_map_view=vis_view,
+                     spatial_shapes=kwargs.get('spatial_shapes', None)
+                )
+
+            if value_view is not None:
+                # ... Fusion Logic (Gradual/Hard Split) ...
                 # 2. Gradual Fusion or Hard Split
                 if self.use_gradual:
                     # Calculate weight: 0 at first layer, 1 at last layer
                     num_layers = len(self.layers)
                     # progress = lid / (num_layers - 1) if num_layers > 1 else 1.0 # Linear 0->1
                     
-                    # Alternatively, start gradual transition AFTER split_layer_index?
-                    # Or simple transition across all layers as requested: "view weight 0->1"
-                    
-                    # Implementation: Linear transition scheme
+                    # Implementation: Linear transition scheme (Lidar Dominant)
+                    # View weight increases: 0.0 -> 1.0
                     view_weight = float(lid) / float(num_layers - 1)
                     view_weight = min(max(view_weight, 0.0), 1.0)
-                    lidar_weight = 1.0 - view_weight
                     
-                    # Fused value
+                    # CHANGED: Lidar weight stays 1.0 instead of decreasing.
+                    # This ensures Lidar (Geometric Base) is never lost.
+                    lidar_weight = 1.0
+                    
+                    # Fused value: Lidar + Scaled View (Residual connection style)
                     if value_lidar is not None:
                         current_value = lidar_weight * value_lidar + view_weight * refined_view
                     else:
@@ -118,6 +258,10 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
             if self.return_intermediate:
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
+
+        # [DEBUG ADDITION]
+        if self.training:
+            self.debug_step += 1
 
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(
