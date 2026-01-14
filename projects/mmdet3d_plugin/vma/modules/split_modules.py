@@ -21,7 +21,7 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
 
         # [DEBUG ADDITION]
         self.debug_step = 0
-        self.debug_dir = "debug_vis_1/attention_check"
+        self.debug_dir = "debug_vis_gt_mask/attention_check"
         try:
             os.makedirs(self.debug_dir, exist_ok=True)
         except Exception:
@@ -45,37 +45,22 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                         nn.init.constant_(m.bias, 0)
 
     # [DEBUG ADDITION]
-    def visualize_reference_points(self, reference_points, layer_idx, img_metas=None, feature_map=None, feature_map_view=None, spatial_shapes=None):
+    def visualize_reference_points(self, reference_points, layer_idx, img_metas=None, feature_map=None, feature_map_view=None, spatial_shapes=None, gt_bboxes_3d=None, gate_values=None, fused_feature=None, view_mask=None, input_lidar_img=None, input_view_img=None):
         """
         reference_points: (BS, Num_Query, 2)
         feature_map: (BS, Len_Seq, C)  Lidar
         feature_map_view: (BS, Len_Seq, C) View
         spatial_shapes: (Num_Levels, 2)
+        input_lidar_img: (BS, 3, H, W) Original input lidar image
+        input_view_img: (BS, 3, H, W) Original input view image
         """
-        # Save every 100 steps
+        # Save every 1000 steps
         if self.debug_step % 1000 != 0:
             return
 
         try:
-            # --- 1. Reference Points Heatmap ---
+            # --- 1. Reference Points (Scatter) ---
             pts = reference_points[0].detach().cpu().numpy()
-            
-            # 使用高斯模糊生成热力图
-            img_h, img_w = 200, 200
-            heatmap = np.zeros((img_h, img_w), dtype=np.float32)
-            
-            px = (pts[:, 0] * img_w).astype(np.int32)
-            py = (pts[:, 1] * img_h).astype(np.int32)
-            
-            valid_mask = (px >= 0) & (px < img_w) & (py >= 0) & (py < img_h)
-            px = px[valid_mask]
-            py = py[valid_mask]
-            
-            for x, y in zip(px, py):
-                heatmap[y, x] += 1
-            
-            heatmap = cv2.GaussianBlur(heatmap, (15, 15), 0)
-            heatmap = heatmap / (heatmap.max() + 1e-9)
             
             # helper to process feature map
             def process_feat(feat_map, s_shapes):
@@ -99,6 +84,8 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                         
                         feat_norm = torch.norm(feat, dim=1).numpy()
                         try:
+                            # Fixed size for visualization
+                            img_h, img_w = 200, 200
                             feat_img = feat_norm.reshape(H, W)
                             feat_img = cv2.resize(feat_img, (img_w, img_h))
                             # Normalize for better vis
@@ -113,43 +100,344 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
             feat_img_view, status_view = process_feat(feature_map_view, spatial_shapes)
 
             # --- Plotting ---
-            plt.figure(figsize=(18, 6))
+            # Determine number of subplots: 3 base + 2 input images if available
+            num_subplots = 3
+            has_input_lidar = input_lidar_img is not None
+            has_input_view = input_view_img is not None
             
-            # Subplot 1: Ref Points Heatmap
-            plt.subplot(1, 3, 1)
-            plt.imshow(heatmap, cmap='jet', extent=[0, 1, 1, 0])
-            plt.title(f"Ref Points Density (L{layer_idx})")
-            plt.colorbar(fraction=0.046, pad=0.04)
+            # [DEBUG] Check if input images are available
+            if self.debug_step % 1000 == 0 and layer_idx == 0:
+                print(f"[DEBUG VIS] Step {self.debug_step} Layer {layer_idx}: "
+                      f"input_lidar_img={'available' if has_input_lidar else 'None'}, "
+                      f"input_view_img={'available' if has_input_view else 'None'}")
             
-            # Subplot 2: Lidar Feature Map
-            plt.subplot(1, 3, 2)
+            if has_input_lidar or has_input_view:
+                num_subplots += 1 if (has_input_lidar and has_input_view) else 1
+            
+            plt.figure(figsize=(6*num_subplots, 6))
+            
+            plot_idx = 0
+            
+            # Subplot 0: Original Input Images (if available)
+            if has_input_lidar or has_input_view:
+                plt.subplot(1, num_subplots, plot_idx + 1)
+                if has_input_lidar and has_input_view:
+                    # Show both side by side
+                    lidar_np = input_lidar_img[0].permute(1, 2, 0).detach().cpu().numpy()
+                    view_np = input_view_img[0].permute(1, 2, 0).detach().cpu().numpy()
+                    # Normalize to [0, 1]
+                    lidar_np = (lidar_np - lidar_np.min()) / (lidar_np.max() - lidar_np.min() + 1e-9)
+                    view_np = (view_np - view_np.min()) / (view_np.max() - view_np.min() + 1e-9)
+                    # Concatenate horizontally
+                    combined = np.concatenate([lidar_np, view_np], axis=1)
+                    plt.imshow(combined, extent=[0, 2, 1, 0])
+                    plt.axvline(x=1, color='white', linewidth=2, linestyle='--')
+                    plt.text(0.5, 0.05, 'Lidar Input', ha='center', transform=plt.gca().transAxes, 
+                            color='white', fontsize=10, bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+                    plt.text(1.5, 0.05, 'View Input', ha='center', transform=plt.gca().transAxes, 
+                            color='white', fontsize=10, bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+                elif has_input_lidar:
+                    lidar_np = input_lidar_img[0].permute(1, 2, 0).detach().cpu().numpy()
+                    lidar_np = (lidar_np - lidar_np.min()) / (lidar_np.max() - lidar_np.min() + 1e-9)
+                    plt.imshow(lidar_np, extent=[0, 1, 1, 0])
+                    plt.text(0.5, 0.05, 'Lidar Input', ha='center', transform=plt.gca().transAxes, 
+                            color='white', fontsize=10, bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+                elif has_input_view:
+                    view_np = input_view_img[0].permute(1, 2, 0).detach().cpu().numpy()
+                    view_np = (view_np - view_np.min()) / (view_np.max() - view_np.min() + 1e-9)
+                    plt.imshow(view_np, extent=[0, 1, 1, 0])
+                    plt.text(0.5, 0.05, 'View Input', ha='center', transform=plt.gca().transAxes, 
+                            color='white', fontsize=10, bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+                plt.xlim(0, 2 if (has_input_lidar and has_input_view) else 1)
+                plt.ylim(1, 0)
+                plt.title("Original Input Images")
+                plt.axis('off')
+                plot_idx += 1
+            
+            # Subplot 1: Lidar Feature Map + Scatter Points
+            plt.subplot(1, num_subplots, plot_idx + 1)
+            plot_idx += 1  # [FIX] Update plot_idx after creating subplot
             if feat_img_lidar is not None:
+                # Normal Colors
                 plt.imshow(feat_img_lidar, cmap='viridis', extent=[0, 1, 1, 0])
-                plt.imshow(heatmap, cmap='jet', alpha=0.3, extent=[0, 1, 1, 0]) 
-                plt.title("Lidar (Lvl 0) + Refs")
+                # Scatter points (red)
+                plt.scatter(pts[:, 0], pts[:, 1], c='red', s=5, alpha=0.9, edgecolors='white', linewidths=0.1, label='Pred')
+                
+                # Draw GT if available (Green)
+                gt_pts = None
+                if gt_bboxes_3d is not None:
+                    try:
+                        gt = gt_bboxes_3d[0] # First sample
+                        
+                        if hasattr(gt, 'instance_list'):
+                             all_pts = []
+                             for line in gt.instance_list:
+                                 l_pts = np.array(line.coords)
+                                 # Normalize if needed
+                                 if hasattr(gt, 'max_x') and hasattr(gt, 'max_y'):
+                                      l_pts[:, 0] /= gt.max_x
+                                      l_pts[:, 1] /= gt.max_y
+                                 all_pts.append(l_pts)
+                             if len(all_pts) > 0:
+                                 gt_pts = np.concatenate(all_pts, axis=0)
+
+                        elif hasattr(gt, 'tensor'):
+                            gt_pts = gt.tensor.cpu().numpy()
+                        else:
+                            gt_pts = gt.cpu().numpy()
+                        
+                        if gt_pts is not None:
+                            if gt_pts.ndim == 3:
+                                gt_pts = gt_pts.reshape(-1, 2)
+                            
+                            # GT usually dense, use smaller size
+                            plt.scatter(gt_pts[:, 0], gt_pts[:, 1], c='lime', s=2, alpha=0.6, label='GT')
+                            
+                    except Exception as e:
+                        print(f"GT Vis Error: {e}")
+                
+                # Add Legend
+                plt.legend(loc='upper right', fontsize='small')
+                plt.xlim(0, 1)
+                plt.ylim(1, 0) # Inverted Y for image coords
+                plt.title("Lidar (Normal) + Pred(Red) + GT(Green)")
             else:
                 plt.text(0.5, 0.5, status_lidar or "No Lidar", ha='center')
                 plt.title("Lidar Skipped")
 
-            # Subplot 3: View Feature Map
-            plt.subplot(1, 3, 3)
+            # Subplot 2: View Feature Map + Scatter Points
+            plt.subplot(1, num_subplots, plot_idx + 1)
+            plot_idx += 1  # [FIX] Update plot_idx after creating subplot
             if feat_img_view is not None:
                 plt.imshow(feat_img_view, cmap='viridis', extent=[0, 1, 1, 0])
-                plt.imshow(heatmap, cmap='jet', alpha=0.3, extent=[0, 1, 1, 0]) 
-                plt.title("View (Lvl 0) + Refs")
+                plt.scatter(pts[:, 0], pts[:, 1], c='red', s=5, alpha=0.9, edgecolors='white', linewidths=0.1)
+                if gt_pts is not None:
+                     plt.scatter(gt_pts[:, 0], gt_pts[:, 1], c='lime', s=2, alpha=0.6)
+                plt.xlim(0, 1)
+                plt.ylim(1, 0)
+                plt.title("View (Normal) + Pred + GT")
             else:
                 plt.text(0.5, 0.5, status_view or "No View", ha='center')
-                plt.title("View Skipped")
+
+            # Subplot 3: Combined Overlay (To check alignment)
+            plt.subplot(1, num_subplots, plot_idx + 1)
+            if feat_img_lidar is not None and feat_img_view is not None:
+                # Blend Lidar (Green Channel) and View (Red Channel) to see misalignment
+                H, W = feat_img_lidar.shape
+                blend = np.zeros((H, W, 3))
+                blend[..., 0] = feat_img_view    # Red = View
+                blend[..., 1] = feat_img_lidar   # Green = Lidar
+                # Blue = 0
                 
+                plt.imshow(blend, extent=[0, 1, 1, 0])
+                plt.scatter(pts[:, 0], pts[:, 1], c='white', s=3, alpha=0.8, label='Pred')
+                plt.title("Alignment Check: R=View, G=Lidar")
+            else: 
+                plt.text(0.5, 0.5, "Cannot Blend", ha='center')
+
             plt.suptitle(f"Step {self.debug_step} Layer {layer_idx}")
             plt.tight_layout()
             
-            save_path = os.path.join(self.debug_dir, f"step_{self.debug_step}_layer_{layer_idx}_heatmap.png")
+            save_path = os.path.join(self.debug_dir, f"step_{self.debug_step}_layer_{layer_idx}_scatter.png")
+            plt.savefig(save_path)
+            plt.close()
+            
+            # [ENHANCED DEBUG] Additional diagnostic plots
+            if gate_values is not None or fused_feature is not None or view_mask is not None:
+                self.visualize_fusion_diagnostics(
+                    reference_points, layer_idx, 
+                    feature_map, feature_map_view, fused_feature,
+                    gate_values, view_mask, spatial_shapes, gt_bboxes_3d
+                )
+            
+        except Exception as e:
+            print(f"Vis error: {e}")
+
+    def visualize_fusion_diagnostics(self, reference_points, layer_idx, 
+                                     feature_map_lidar, feature_map_view, fused_feature,
+                                     gate_values, view_mask, spatial_shapes, gt_bboxes_3d):
+        """Enhanced visualization for fusion diagnostics"""
+        if self.debug_step % 1000 != 0:
+            return
+            
+        try:
+            pts = reference_points[0].detach().cpu().numpy()
+            
+            def process_feat(feat_map, s_shapes):
+                feat_img = None
+                status = ""
+                if feat_map is not None and s_shapes is not None:
+                    try:
+                        # Handle different input shapes
+                        if feat_map.dim() == 2:
+                            # (BS, Num_Keys) or (Num_Keys, C)
+                            if feat_map.shape[0] > feat_map.shape[1] and feat_map.shape[1] > 1:
+                                seq_dim = 0
+                            else:
+                                seq_dim = 1
+                        elif feat_map.dim() == 3:
+                            # (BS, Num_Keys, C) or (Num_Keys, BS, C)
+                            if feat_map.shape[1] != feat_map.shape[0] and feat_map.shape[0] > feat_map.shape[1]:
+                                seq_dim = 0
+                            else:
+                                seq_dim = 1
+                        else:
+                            status = f"Unexpected dim: {feat_map.dim()}"
+                            return feat_img, status
+                        
+                        current_len = feat_map.shape[seq_dim]
+                        H, W = s_shapes[0].tolist()
+                        feat_len = H * W
+                        
+                        if current_len >= feat_len:
+                            if seq_dim == 0:
+                                if feat_map.dim() == 2:
+                                    feat = feat_map[:feat_len, :].detach().cpu()
+                                else:
+                                    feat = feat_map[:feat_len, 0, :].detach().cpu()
+                            else:
+                                if feat_map.dim() == 2:
+                                    feat = feat_map[0, :feat_len].unsqueeze(-1).detach().cpu()  # Add channel dim
+                                else:
+                                    feat = feat_map[0, :feat_len, :].detach().cpu()
+                            
+                            # Compute norm if multi-channel, otherwise use directly
+                            if feat.dim() == 2 and feat.shape[1] > 1:
+                                feat_norm = torch.norm(feat, dim=1).numpy()
+                            else:
+                                feat_norm = feat.squeeze(-1).numpy() if feat.dim() == 2 else feat.numpy()
+                            
+                            try:
+                                img_h, img_w = 200, 200
+                                feat_img = feat_norm.reshape(H, W)
+                                feat_img = cv2.resize(feat_img, (img_w, img_h))
+                                feat_img = (feat_img - feat_img.min()) / (feat_img.max() - feat_img.min() + 1e-9)
+                            except (ValueError, RuntimeError) as e:
+                                status = f"Reshape/Resize error: {e}"
+                        else:
+                            status = f"Size mismatch: {current_len} < {feat_len}"
+                    except Exception as e:
+                        status = f"Process error: {e}"
+                else:
+                    status = "No input"
+                return feat_img, status
+            
+            num_plots = 2
+            if gate_values is not None:
+                num_plots += 1
+            if view_mask is not None:
+                num_plots += 1
+            if fused_feature is not None:
+                num_plots += 1
+                
+            fig, axes = plt.subplots(1, num_plots, figsize=(6*num_plots, 6))
+            if num_plots == 1:
+                axes = [axes]
+            
+            plot_idx = 0
+            
+            # Plot 1: Gate values
+            if gate_values is not None:
+                try:
+                    # gate_values: (BS, Num_Keys, C) -> take mean over channel dim
+                    gate_mean = gate_values.mean(dim=-1)  # (BS, Num_Keys)
+                    if gate_mean.dim() == 2:
+                        # Add channel dim for process_feat: (BS, Num_Keys) -> (BS, Num_Keys, 1)
+                        gate_mean = gate_mean.unsqueeze(-1)
+                    gate_img, gate_status = process_feat(gate_mean, spatial_shapes)
+                    if gate_img is not None:
+                        axes[plot_idx].imshow(gate_img, cmap='hot', extent=[0, 1, 1, 0])
+                        axes[plot_idx].scatter(pts[:, 0], pts[:, 1], c='cyan', s=3, alpha=0.6)
+                        axes[plot_idx].set_title(f"Gate Values (mean={gate_values.mean().item():.3f})")
+                        axes[plot_idx].set_xlim(0, 1)
+                        axes[plot_idx].set_ylim(1, 0)
+                    else:
+                        axes[plot_idx].text(0.5, 0.5, f"Gate: {gate_status}", ha='center', va='center')
+                        axes[plot_idx].set_title("Gate Values (Failed)")
+                    plot_idx += 1
+                except Exception as e:
+                    if plot_idx < len(axes):
+                        axes[plot_idx].text(0.5, 0.5, f"Gate Error: {e}", ha='center', va='center')
+                        plot_idx += 1
+            
+            # Plot 2: View Mask
+            if view_mask is not None:
+                try:
+                    # view_mask: (BS, Num_Keys) bool, True=invalid, False=valid
+                    # Convert to float for visualization: 1.0=invalid, 0.0=valid
+                    view_mask_float = view_mask.float() if view_mask.dtype == torch.bool else view_mask
+                    if view_mask_float.dim() == 2:
+                        view_mask_expanded = view_mask_float.unsqueeze(-1)  # (BS, Num_Keys, 1)
+                    else:
+                        view_mask_expanded = view_mask_float
+                    mask_img, mask_status = process_feat(view_mask_expanded, spatial_shapes)
+                    if mask_img is not None:
+                        axes[plot_idx].imshow(mask_img, cmap='gray', extent=[0, 1, 1, 0])
+                        # valid_ratio: False (valid) / total
+                        valid_ratio = (~view_mask).float().mean().item() if view_mask.dtype == torch.bool else (view_mask < 0.5).float().mean().item()
+                        axes[plot_idx].set_title(f"View Mask (valid={valid_ratio:.2%})")
+                        axes[plot_idx].set_xlim(0, 1)
+                        axes[plot_idx].set_ylim(1, 0)
+                    else:
+                        axes[plot_idx].text(0.5, 0.5, f"Mask: {mask_status}", ha='center', va='center')
+                        axes[plot_idx].set_title("View Mask (Failed)")
+                    plot_idx += 1
+                except Exception as e:
+                    if plot_idx < len(axes):
+                        axes[plot_idx].text(0.5, 0.5, f"Mask Error: {e}", ha='center', va='center')
+                        plot_idx += 1
+            
+            # Plot 3: Fused Feature
+            if fused_feature is not None:
+                try:
+                    fused_img, fused_status = process_feat(fused_feature, spatial_shapes)
+                    if fused_img is not None:
+                        axes[plot_idx].imshow(fused_img, cmap='viridis', extent=[0, 1, 1, 0])
+                        axes[plot_idx].scatter(pts[:, 0], pts[:, 1], c='red', s=3, alpha=0.6)
+                        axes[plot_idx].set_title("Fused Feature")
+                        axes[plot_idx].set_xlim(0, 1)
+                        axes[plot_idx].set_ylim(1, 0)
+                    else:
+                        axes[plot_idx].text(0.5, 0.5, f"Fused: {fused_status}", ha='center', va='center')
+                        axes[plot_idx].set_title("Fused Feature (Failed)")
+                    plot_idx += 1
+                except Exception as e:
+                    if plot_idx < len(axes):
+                        axes[plot_idx].text(0.5, 0.5, f"Fused Error: {e}", ha='center', va='center')
+                        plot_idx += 1
+            
+            # Plot 4: Feature Statistics
+            stats_text = []
+            if feature_map_lidar is not None:
+                lidar_mean = feature_map_lidar.mean().item()
+                lidar_std = feature_map_lidar.std().item()
+                stats_text.append(f"Lidar: μ={lidar_mean:.3f}, σ={lidar_std:.3f}")
+            if feature_map_view is not None:
+                view_mean = feature_map_view.mean().item()
+                view_std = feature_map_view.std().item()
+                stats_text.append(f"View: μ={view_mean:.3f}, σ={view_std:.3f}")
+            if fused_feature is not None:
+                fused_mean = fused_feature.mean().item()
+                fused_std = fused_feature.std().item()
+                stats_text.append(f"Fused: μ={fused_mean:.3f}, σ={fused_std:.3f}")
+            
+            if len(stats_text) > 0 and plot_idx < len(axes):
+                axes[plot_idx].text(0.1, 0.5, '\n'.join(stats_text), 
+                                   transform=axes[plot_idx].transAxes,
+                                   fontsize=10, verticalalignment='center',
+                                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                axes[plot_idx].set_title("Feature Statistics")
+                axes[plot_idx].axis('off')
+            
+            plt.suptitle(f"Fusion Diagnostics - Step {self.debug_step} Layer {layer_idx}")
+            plt.tight_layout()
+            
+            save_path = os.path.join(self.debug_dir, f"step_{self.debug_step}_layer_{layer_idx}_fusion_diag.png")
             plt.savefig(save_path)
             plt.close()
             
         except Exception as e:
-            print(f"Vis error: {e}")
+            print(f"Fusion diag vis error: {e}")
 
     def forward(self,
                 query,
@@ -171,6 +459,7 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
             current_value = value_lidar
 
             refined_view = None # 初始化 refined_view
+            gate_values = None
             if value_view is not None:
                 # 1. Gating / Noise Filtering
                 refined_view = value_view
@@ -182,6 +471,7 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     cat_feat = torch.cat([value_lidar, value_view], dim=-1)
                     gate = self.gating_module(cat_feat)
                     refined_view = value_view * gate
+                    gate_values = gate  # Save for visualization
 
             # [DEBUG ADDITION]
             if self.training:
@@ -197,7 +487,9 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                      # Let's visualize the RAW Inputs to this layer fusion.
                      # Lidar = value_lidar
                      feature_map_view=vis_view,
-                     spatial_shapes=kwargs.get('spatial_shapes', None)
+                     spatial_shapes=kwargs.get('spatial_shapes', None),
+                     input_lidar_img=kwargs.get('input_lidar_img', None),  # [DEBUG VIS] Pass input images
+                     input_view_img=kwargs.get('input_view_img', None)  # [DEBUG VIS]
                 )
 
             if value_view is not None:
@@ -213,9 +505,13 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     view_weight = float(lid) / float(num_layers - 1)
                     view_weight = min(max(view_weight, 0.0), 1.0)
                     
-                    # CHANGED: Lidar weight stays 1.0 instead of decreasing.
-                    # This ensures Lidar (Geometric Base) is never lost.
+                    # [FIX] Normalize weights to prevent feature magnitude explosion
+                    # Option 1: Keep lidar=1.0, scale view proportionally
                     lidar_weight = 1.0
+                    # Option 2: Normalize so sum = 1.0 (alternative, commented out)
+                    # total_weight = lidar_weight + view_weight
+                    # lidar_weight = lidar_weight / total_weight
+                    # view_weight = view_weight / total_weight
                     
                     # Fused value: Lidar + Scaled View (Residual connection style)
                     if value_lidar is not None:
@@ -254,6 +550,29 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
 
                 reference_points = new_reference_points.detach()
 
+            # [DEBUG ADDITION]
+            if self.training:
+                 # Pass both Lidar (value_lidar) and View (refined_view OR value_view)
+                 # We prefer showing refined_view if gating is ON, to see what actually goes into fusion
+                 vis_view = refined_view if refined_view is not None else value_view
+                 
+                 # Get view mask from kwargs if available
+                 view_mask_vis = kwargs.get('view_mask', None)
+                 
+                 self.visualize_reference_points(
+                     reference_points, 
+                     lid, 
+                     feature_map=value_lidar, 
+                     feature_map_view=vis_view,
+                     spatial_shapes=kwargs.get('spatial_shapes', None),
+                     gt_bboxes_3d=kwargs.get('gt_bboxes_3d', None),
+                     gate_values=gate_values,
+                     fused_feature=current_value if value_view is not None else None,
+                     view_mask=view_mask_vis,
+                     input_lidar_img=kwargs.get('input_lidar_img', None),
+                     input_view_img=kwargs.get('input_view_img', None)
+                )
+
             output = output.permute(1, 0, 2)
             if self.return_intermediate:
                 intermediate.append(output)
@@ -287,6 +606,7 @@ class SplitModalityTransformer(DeformableDetrTransformer):
                 mlvl_feats_view=None,
                 reg_branches=None,
                 cls_branches=None,
+                gt_bboxes_3d=None, # [DEBUG VIS]
                 **kwargs):
         
         assert self.as_two_stage is False, "SplitModalityTransformer only supports non-two-stage mode for now."
@@ -350,33 +670,66 @@ class SplitModalityTransformer(DeformableDetrTransformer):
         
         # --- 3. Process View Feats ---
         memory_view = None
+        mask_flatten_view = None
         if mlvl_feats_view is not None:
             feat_flatten_view = []
+            mask_flatten_view_list = []
+            
+            # [FIX] Generate View mask similar to Lidar mask (based on img_shape from img_metas)
+            # Reference: vmahead.py 
+            mlvl_masks_view = None
+            if kwargs.get('img_metas', None) is not None:
+                img_metas = kwargs.get('img_metas')
+                import torch.nn.functional as F
+                input_img_h, input_img_w = img_metas[0]['img_shape']
+                # Create mask: 1=invalid (padding), 0=valid
+                # Same logic as lidar mask generation
+                img_masks_view = mlvl_feats_view[0].new_ones((bs, input_img_h, input_img_w))
+                for img_id in range(bs):
+                    img_h, img_w = img_metas[img_id]['img_shape']
+                    img_masks_view[img_id, :img_h, :img_w] = 0
+                
+                mlvl_masks_view = []
+                for feat_view in mlvl_feats_view:
+                    # Interpolate mask to match feature map size
+                    mask_view = F.interpolate(img_masks_view[None], size=feat_view.shape[-2:]).to(torch.bool).squeeze(0)
+                    mlvl_masks_view.append(mask_view)
+            
             for lvl, feat in enumerate(mlvl_feats_view):
                 # Assume alignment with Lidar
-                feat = feat.flatten(2).transpose(1, 2)
-                # Note: We reuse the same level embeddings logic, but applied to view features
-                # lvl_pos_embed is already calculated above and matches if shapes match
+                feat = feat.flatten(2).transpose(1, 2)  # (BS, H*W, C)
                 
-                # However, for the encoder input, we generally want the feature + level_embed (sometimes)
-                # But DeformableDetrTransformerEncoder usually takes 'query' (feature) and 'query_pos' (pos + lvl)
-                # In the loop above `lvl_pos_embed` = `pos_embed` + `level_embed`.
-                # We can reuse `lvl_pos_embed_flatten` because spatial shapes are the same.
+                # [FIX] Use View mask similar to Lidar mask (based on img_shape)
+                # If mlvl_masks_view is available, use it; otherwise fallback to lidar mask or feature-based mask
+                if mlvl_masks_view is not None and lvl < len(mlvl_masks_view):
+                    # Use view mask generated from img_shape (same logic as lidar)
+                    view_mask = mlvl_masks_view[lvl].flatten(1)  # (BS, H*W) bool, True=invalid
+                elif lvl < len(mlvl_masks):
+                    # Fallback: use lidar mask if view mask not available
+                    view_mask = mlvl_masks[lvl].flatten(1)  # (BS, H*W) bool, True=invalid
+                else:
+                    # Last resort: generate mask based on feature magnitude
+                    with torch.no_grad():
+                        feat_magnitude = torch.norm(feat, p=2, dim=-1)  # (BS, H*W)
+                        view_valid = feat_magnitude > 1e-4  # (BS, H*W) bool
+                        view_mask = ~view_valid  # (BS, H*W) bool, True=invalid
                 
+                mask_flatten_view_list.append(view_mask)
                 feat_flatten_view.append(feat)
             
             # Combine levels
             feat_flatten_view = torch.cat(feat_flatten_view, 1) # (BS, Total_Len, C)
+            mask_flatten_view = torch.cat(mask_flatten_view_list, 1)  # (BS, Total_Len)
             
             # Pass through View Encoder if it exists
             if self.encoder_view is not None:
-                # Reuse geometry info from Lidar branch since we enforced alignment
+                # [FIX] Use View's own mask instead of Lidar mask
                 memory_view = self.encoder_view(
                     query=feat_flatten_view.permute(1, 0, 2), # (Len, BS, C)
                     key=None,
                     value=None,
                     query_pos=lvl_pos_embed_flatten.permute(1, 0, 2), # Reuse pos embeds
-                    query_key_padding_mask=mask_flatten,              # Reuse masks
+                    query_key_padding_mask=mask_flatten_view,          # [FIX] Use View mask
                     spatial_shapes=spatial_shapes,
                     level_start_index=level_start_index,
                     valid_ratios=valid_ratios,
@@ -397,6 +750,10 @@ class SplitModalityTransformer(DeformableDetrTransformer):
         query = query.permute(1, 0, 2)
         query_pos = query_pos.permute(1, 0, 2)
 
+        # [DEBUG VIS] Extract input images from kwargs to avoid duplicate arguments
+        input_lidar_img = kwargs.pop('input_lidar_img', None)
+        input_view_img = kwargs.pop('input_view_img', None)
+
         inter_states, inter_references = self.decoder(
             query=query,
             key=None,
@@ -409,6 +766,10 @@ class SplitModalityTransformer(DeformableDetrTransformer):
             level_start_index=level_start_index,
             valid_ratios=valid_ratios,
             reg_branches=reg_branches,
+            gt_bboxes_3d=gt_bboxes_3d, # [DEBUG VIS]
+            view_mask=mask_flatten_view,  # [FIX] Pass view mask to decoder
+            input_lidar_img=input_lidar_img,  # [DEBUG VIS] Pass input images
+            input_view_img=input_view_img,  # [DEBUG VIS]
             **kwargs)
             
         return inter_states, init_reference_out, inter_references, None, None

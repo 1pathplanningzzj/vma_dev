@@ -256,7 +256,26 @@ class VMAHead(DETRHead):
                 mlvl_feats, 
                 mlvl_feats_view=None,  # View分支特征
                 img_metas=None, 
-                ):
+                gt_bboxes_3d=None,     # [DEBUG VIS]
+                input_lidar_img=None,  # [DEBUG VIS] Original input lidar image
+                input_view_img=None,   # [DEBUG VIS] Original input view image
+                **kwargs):
+        
+        # [DEBUG CHECK] Verify Feature Map Dimensions
+        if self.training: # Check only during training to avoid spam in inference
+            for i, f in enumerate(mlvl_feats):
+                if f.shape[2] <= 1 or f.shape[3] <= 1:
+                     print(f"[ERROR] Lidar Feature Level {i} Collapse! Shape: {f.shape}")
+                # else:
+                #      print(f"[INFO] Lidar Level {i} Shape: {f.shape}")
+
+            if mlvl_feats_view:
+                for i, f in enumerate(mlvl_feats_view):
+                    if f.shape[2] <= 1 or f.shape[3] <= 1:
+                        print(f"[ERROR] View Feature Level {i} Collapse! Shape: {f.shape}")
+                    # else:
+                    #     print(f"[INFO] View Level {i} Shape: {f.shape}")
+
         bs = mlvl_feats[0].shape[0]
         dtype = mlvl_feats[0].dtype
         gram_loss = 0.0 
@@ -384,6 +403,10 @@ class VMAHead(DETRHead):
                 mlvl_positional_encodings.append(pos_enc)
 
         # -------------------------- 5. 调用Transformer（输入适配后的Query） --------------------------    
+        # [DEBUG VIS] Use original input images from function parameters (passed from detector)
+        # Note: input_lidar_img and input_view_img are explicit function parameters, not in kwargs
+        # They are passed directly from detector.forward_pts_train()
+        
         outputs = self.transformer(
             mlvl_feats=mlvl_feats,
             mlvl_feats_view=mlvl_feats_view_processed,
@@ -392,6 +415,9 @@ class VMAHead(DETRHead):
             mlvl_pos_embeds=mlvl_positional_encodings,
             reg_branches=self.reg_branches if self.with_box_refine else None,
             cls_branches=self.cls_branches if self.as_two_stage else None,
+            gt_bboxes_3d=gt_bboxes_3d,  # [DEBUG VIS]
+            input_lidar_img=input_lidar_img,  # [DEBUG VIS] Pass input images (from function parameter)
+            input_view_img=input_view_img  # [DEBUG VIS] Pass input images (from function parameter)
         )
         
         hs, init_reference, inter_references, _, _ = outputs

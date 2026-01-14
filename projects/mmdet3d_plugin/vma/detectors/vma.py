@@ -88,12 +88,31 @@ class VMA(MVXTwoStageDetector):
             # 注意：需与数据加载时的通道拼接逻辑一致
             if self.modality["use_lidar_map"]:
                 lidar_img = imgs[:, 0:3, :, :].contiguous()  # [B, 3, H, W]
+                # [DEBUG VIS] Save Input Image
+                if self.train_cfg is not None and getattr(self, 'debug_input_counter', 0) < 3: # Save first 3 batches
+                   import torchvision.utils as vutils
+                   import os
+                   self.debug_input_counter = getattr(self, 'debug_input_counter', 0) + 1
+                   os.makedirs('debug_vis_input', exist_ok=True)
+                   vutils.save_image(lidar_img, f'debug_vis_input/input_lidar_batch_{self.debug_input_counter}.png', normalize=True)
             else:
                 lidar_img = None
             if self.modality["use_view_map"]:
                 view_img = imgs[:, 3:6, :, :].contiguous()  # [B, 3, H, W]
             else:
                 view_img = None
+            
+            # [DEBUG VIS] Store original input images for visualization (BEFORE grid_mask processing)
+            # Save to instance variable so it can be accessed later
+            # IMPORTANT: Save BEFORE applying grid_mask to preserve original images
+            if self.training:
+                self._debug_input_lidar_img = lidar_img.clone() if lidar_img is not None else None
+                self._debug_input_view_img = view_img.clone() if view_img is not None else None
+                # [DEBUG] Print once per batch to verify images are saved
+                if not hasattr(self, '_debug_img_saved') or not self._debug_img_saved:
+                    print(f"[DEBUG DETECTOR] Saved input images: lidar={'available' if self._debug_input_lidar_img is not None else 'None'}, "
+                          f"view={'available' if self._debug_input_view_img is not None else 'None'}")
+                    self._debug_img_saved = True
 
             # 1. 提取lidar分支特征（主分支）
             if self.modality["use_lidar_map"] and lidar_img is not None:
@@ -142,11 +161,23 @@ class VMA(MVXTwoStageDetector):
                         img_metas,
                         ):
         """点云分支训练前向（传递双分支特征到Head）"""
+        # [DEBUG VIS] Get original input images if available
+        input_lidar_img = getattr(self, '_debug_input_lidar_img', None)
+        input_view_img = getattr(self, '_debug_input_view_img', None)
+        
+        # [DEBUG] Print to verify images are retrieved
+        # if input_lidar_img is not None or input_view_img is not None:
+            # print(f"[DEBUG DETECTOR->HEAD] Passing images: lidar={'available' if input_lidar_img is not None else 'None'}, "
+            #       f"view={'available' if input_view_img is not None else 'None'}")
+        
         # 调用VMAHead.forward，传入双分支特征
         outs = self.pts_bbox_head(
             mlvl_feats=lidar_feats,       # lidar分支多尺度特征
             mlvl_feats_view=view_feats,   # view分支多尺度特征
-            img_metas=img_metas
+            img_metas=img_metas,
+            gt_bboxes_3d=gt_bboxes,       # [DEBUG VIS] Pass GT to head
+            input_lidar_img=input_lidar_img,  # [DEBUG VIS] Pass original input images
+            input_view_img=input_view_img     # [DEBUG VIS]
         )
         # 计算损失
         loss_inputs = [gt_labels, gt_bboxes, gt_attrs, outs]
