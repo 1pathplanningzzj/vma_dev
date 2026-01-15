@@ -1,15 +1,3 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import os
-import numpy as np
-import cv2  # 用于热力图平滑和缩放
-from mmdet.models.utils.builder import TRANSFORMER
-from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
-from mmdet.models.utils.transformer import DeformableDetrTransformer, inverse_sigmoid
-from mmcv.cnn.bricks.transformer import build_transformer_layer_sequence
-from .decoder import VMADetectionTransformerDecoder
 # date 2026-01-15
 # author: zijian
 # email: zhangzijian@trunk.tech
@@ -19,6 +7,20 @@ from .decoder import VMADetectionTransformerDecoder
 # It is also used to predict the bounding boxes of the objects.
 # It is also used to predict the classes of the objects.
 # It is also used to predict the scores of the objects.
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+import cv2  # 用于热力图平滑和缩放
+from mmdet.models.utils.builder import TRANSFORMER
+from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
+from mmdet.models.utils.transformer import DeformableDetrTransformer, inverse_sigmoid
+from mmcv.cnn.bricks.transformer import build_transformer_layer_sequence
+from .decoder import VMADetectionTransformerDecoder
+
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
 class SplitModalityDecoder(VMADetectionTransformerDecoder):
     def __init__(self, *args, split_layer_index=3, use_gating=True, use_gradual=True, 
@@ -97,7 +99,7 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
 
         # [DEBUG ADDITION]
         self.debug_step = 0
-        self.debug_dir = "debug_vis_gt_mask_2/attention_check"
+        self.debug_dir = "debug_vis_gt_mask_3/attention_check"
         try:
             os.makedirs(self.debug_dir, exist_ok=True)
         except Exception:
@@ -406,12 +408,24 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     status = "No input"
                 return feat_img, status
             
-            num_plots = 2
-            if gate_values is not None:
+            # 动态确定需要的子图数量，避免出现未使用的空白坐标轴
+            num_plots = 0
+            has_gate_plot = gate_values is not None
+            has_view_mask_plot = view_mask is not None
+            has_fused_plot = fused_feature is not None
+
+            if has_gate_plot:
                 num_plots += 1
-            if view_mask is not None:
+            if has_view_mask_plot:
                 num_plots += 1
-            if fused_feature is not None:
+            if has_fused_plot:
+                num_plots += 1
+
+            # 统计信息单独占一个子图（只要有任意一种特征存在就画）
+            has_stats_plot = (feature_map_lidar is not None) or \
+                             (feature_map_view is not None) or \
+                             (fused_feature is not None)
+            if has_stats_plot:
                 num_plots += 1
                 
             fig, axes = plt.subplots(1, num_plots, figsize=(6*num_plots, 6))
@@ -551,8 +565,9 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
             
             current_value = value_lidar
 
-            refined_view = None # 初始化 refined_view
+            refined_view = None  # 初始化 refined_view
             gate_values = None
+            fused_feature_for_vis = None  # 用于可视化的 BEV 融合特征
             if value_view is not None:
                 # 1. Gating / Noise Filtering
                 refined_view = value_view
@@ -573,23 +588,27 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     refined_view = value_view * gate
                     gate_values = gate  # Save for visualization
 
+                # 为了诊断方便，在 BEV 空间上构造一个简单的“融合特征”用于可视化
+                if value_lidar is not None:
+                    lidar_vis = F.layer_norm(value_lidar, value_lidar.shape[-1:])
+                    base_view = refined_view if refined_view is not None else value_view
+                    view_vis = F.layer_norm(base_view, base_view.shape[-1:])
+                    # 这里使用 0.5/0.5 等权，仅用于可视化，与真实解码器权重解耦
+                    fused_feature_for_vis = 0.5 * lidar_vis + 0.5 * view_vis
+
             # [DEBUG ADDITION]
             if self.training:
-                 # Pass both Lidar (value_lidar) and View (refined_view OR value_view)
-                 # We prefer showing refined_view if gating is ON, to see what actually goes into fusion
-                 vis_view = refined_view if refined_view is not None else value_view
-                 self.visualize_reference_points(
-                     reference_points, 
-                     lid, 
-                     feature_map=kwargs.get('value', None), # This is usually 'current_value' from PREVIOUS layer logic? Wait, kwargs['value'] is updated at end of loop.
-                     # Actually 'value_lidar' is constant across layers as "Memory".
-                     # The decoder usually takes 'memory' as input. 
-                     # Let's visualize the RAW Inputs to this layer fusion.
-                     # Lidar = value_lidar
-                     feature_map_view=vis_view,
-                     spatial_shapes=kwargs.get('spatial_shapes', None),
-                     input_lidar_img=kwargs.get('input_lidar_img', None),  # [DEBUG VIS] Pass input images
-                     input_view_img=kwargs.get('input_view_img', None)  # [DEBUG VIS]
+                # Pass both Lidar (value_lidar) and View (refined_view OR value_view)
+                # We prefer showing refined_view if gating is ON, to see what actually goes into fusion
+                vis_view = refined_view if refined_view is not None else value_view
+                self.visualize_reference_points(
+                    reference_points,
+                    lid,
+                    feature_map=value_lidar,
+                    feature_map_view=vis_view,
+                    spatial_shapes=kwargs.get('spatial_shapes', None),
+                    input_lidar_img=kwargs.get('input_lidar_img', None),  # [DEBUG VIS] Pass input images
+                    input_view_img=kwargs.get('input_view_img', None)  # [DEBUG VIS]
                 )
 
             if value_view is not None:
@@ -824,25 +843,25 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
 
             # [DEBUG ADDITION]
             if self.training:
-                 # Pass both Lidar (value_lidar) and View (refined_view OR value_view)
-                 # We prefer showing refined_view if gating is ON, to see what actually goes into fusion
-                 vis_view = refined_view if refined_view is not None else value_view
-                 
-                 # Get view mask from kwargs if available
-                 view_mask_vis = kwargs.get('view_mask', None)
-                 
-                 self.visualize_reference_points(
-                     reference_points, 
-                     lid, 
-                     feature_map=value_lidar, 
-                     feature_map_view=vis_view,
-                     spatial_shapes=kwargs.get('spatial_shapes', None),
-                     gt_bboxes_3d=kwargs.get('gt_bboxes_3d', None),
-                     gate_values=gate_values,
-                     fused_feature=current_value if value_view is not None else None,
-                     view_mask=view_mask_vis,
-                     input_lidar_img=kwargs.get('input_lidar_img', None),
-                     input_view_img=kwargs.get('input_view_img', None)
+                # Pass both Lidar (value_lidar) and View (refined_view OR value_view)
+                # We prefer showing refined_view if gating is ON, to see what actually goes into fusion
+                vis_view = refined_view if refined_view is not None else value_view
+                
+                # Get view mask from kwargs if available
+                view_mask_vis = kwargs.get('view_mask', None)
+                
+                self.visualize_reference_points(
+                    reference_points, 
+                    lid, 
+                    feature_map=value_lidar, 
+                    feature_map_view=vis_view,
+                    spatial_shapes=kwargs.get('spatial_shapes', None),
+                    gt_bboxes_3d=kwargs.get('gt_bboxes_3d', None),
+                    gate_values=gate_values,
+                    fused_feature=fused_feature_for_vis,
+                    view_mask=view_mask_vis,
+                    input_lidar_img=kwargs.get('input_lidar_img', None),
+                    input_view_img=kwargs.get('input_view_img', None)
                 )
 
             # [FIX] output should be (num_query, bs, embed_dims) when appending to intermediate

@@ -1,3 +1,6 @@
+from typing import Literal
+
+
 find_unused_parameters = True
 
 log_config = dict(
@@ -214,6 +217,7 @@ model = dict(
             encoder_view=dict(
                 type='DetrTransformerEncoder',
                 num_layers=6,
+                # 与上方 encoder 相同的结构，这里不需要类型注解，保持为普通 dict
                 transformerlayers=dict(
                     type='BaseTransformerLayer',
                     attn_cfgs=dict(
