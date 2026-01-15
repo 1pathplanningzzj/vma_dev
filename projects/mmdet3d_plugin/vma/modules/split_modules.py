@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import os
 import numpy as np
@@ -9,19 +10,94 @@ from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
 from mmdet.models.utils.transformer import DeformableDetrTransformer, inverse_sigmoid
 from mmcv.cnn.bricks.transformer import build_transformer_layer_sequence
 from .decoder import VMADetectionTransformerDecoder
-
+# date 2026-01-15
+# author: zijian
+# email: zhangzijian@trunk.tech
+# description: This file is the implementation of the SplitModalityDecoder class.
+# It is used to decode the features of the lidar and view modalities.
+# It is also used to fuse the features of the lidar and view modalities.
+# It is also used to predict the bounding boxes of the objects.
+# It is also used to predict the classes of the objects.
+# It is also used to predict the scores of the objects.
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
 class SplitModalityDecoder(VMADetectionTransformerDecoder):
-    def __init__(self, *args, split_layer_index=3, use_gating=True, use_gradual=True, **kwargs):
+    def __init__(self, *args, split_layer_index=3, use_gating=True, use_gradual=True, 
+                 use_dual_cross_attn=False, 
+                 use_adaptive_weights=False,
+                 use_modality_interaction=False,
+                 use_conditional_fusion=False,
+                 lidar_first=True,  # [NEW] Lidar first (main modality), then View (auxiliary)
+                 gate_temperature=1.0,  # [FIX] Add as explicit parameter
+                 embed_dims=256,  # [FIX] Add as explicit parameter
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.split_layer_index = split_layer_index
         self.use_gating = use_gating
         self.use_gradual = use_gradual
+        # [NEW] Enable dual cross attention: query attends to both View and Lidar separately
+        self.use_dual_cross_attn = use_dual_cross_attn
+        self.use_adaptive_weights = use_adaptive_weights
+        self.use_modality_interaction = use_modality_interaction
+        self.use_conditional_fusion = use_conditional_fusion
+        self.lidar_first = lidar_first  # Lidar is main modality, process first
+        self.gate_temperature = gate_temperature  # [FIX] Store gate_temperature
+        
+        # [FIX] Get embed_dims from kwargs if provided, otherwise use parameter value
+        if 'embed_dims' in kwargs:
+            embed_dims = kwargs.pop('embed_dims')  # Use kwargs value and remove it
+        # Otherwise use the parameter value (already set as embed_dims=256)
+        
+        # [NEW] Adaptive weight learning module
+        if self.use_adaptive_weights:
+            self.adaptive_weight_module = nn.Sequential(
+                nn.Linear(embed_dims * 2, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, 2),  # Output: [lidar_weight, view_weight]
+                nn.Softmax(dim=-1)  # Ensure weights sum to 1.0
+            )
+            # Initialize to favor Lidar (main modality)
+            linear_layers = [m for m in self.adaptive_weight_module.modules() if isinstance(m, nn.Linear)]
+            for idx, m in enumerate(linear_layers):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    if idx == len(linear_layers) - 1:  # Last Linear layer (before Softmax)
+                        # Bias to favor Lidar: [lidar_bias, view_bias] = [1.0, -1.0]
+                        with torch.no_grad():
+                            m.bias.data = torch.tensor([1.0, -1.0], dtype=m.bias.dtype, device=m.bias.device)
+                    else:
+                        nn.init.constant_(m.bias, 0)
+        
+        # [NEW] Modality interaction module (for cross-modal guidance)
+        if self.use_modality_interaction:
+            self.modality_interaction = nn.Sequential(
+                nn.Linear(embed_dims * 2, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, embed_dims)
+            )
+            for m in self.modality_interaction.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+        
+        # [NEW] Conditional fusion module (query-dependent modality selection)
+        if self.use_conditional_fusion:
+            self.conditional_fusion = nn.Sequential(
+                nn.Linear(embed_dims, embed_dims // 2),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims // 2, 2),  # Output: [lidar_gate, view_gate]
+                nn.Sigmoid()
+            )
+            for m in self.conditional_fusion.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
         # self.test = False
 
         # [DEBUG ADDITION]
         self.debug_step = 0
-        self.debug_dir = "debug_vis_gt_mask/attention_check"
+        self.debug_dir = "debug_vis_gt_mask_2/attention_check"
         try:
             os.makedirs(self.debug_dir, exist_ok=True)
         except Exception:
@@ -29,19 +105,27 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         
         # Gating module: Learn to filter view features based on lidar features
         if self.use_gating:
-            embed_dims = kwargs.get('embed_dims', 256)
+            # embed_dims is already set above from parameter or kwargs
             self.gating_module = nn.Sequential(
                 nn.Linear(embed_dims * 2, embed_dims),
                 nn.ReLU(inplace=True),
                 nn.Linear(embed_dims, embed_dims),
                 nn.Sigmoid()
             )
+            
+            # [IMPROVED] Gate temperature is already set as self.gate_temperature above
 
-            # Initialize weights
-            for m in self.gating_module.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    if m.bias is not None:
+            # Initialize weights with conservative bias
+            # [IMPROVED] Make initial gate values more conservative
+            # Find the last Linear layer (before Sigmoid) and set negative bias
+            linear_layers = [m for m in self.gating_module.modules() if isinstance(m, nn.Linear)]
+            for idx, m in enumerate(linear_layers):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    if idx == len(linear_layers) - 1:  # Last Linear layer (before Sigmoid)
+                        # Set negative bias to make initial gate values smaller
+                        nn.init.constant_(m.bias, -1.0)  # Initial gate ≈ 0.27
+                    else:
                         nn.init.constant_(m.bias, 0)
 
     # [DEBUG ADDITION]
@@ -456,6 +540,15 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         value_lidar = kwargs.get('value', None)
         
         for lid, layer in enumerate(self.layers):
+            # [FIX] Ensure output is in correct shape (num_query, bs, embed_dims) at start of each iteration
+            # output should be (num_query, bs, embed_dims) for layer input
+            if lid > 0:  # After first layer, output might have been permuted
+                # Check if output needs to be converted back to (num_query, bs, embed_dims)
+                if output.dim() == 3:
+                    # If output is (bs, num_query, embed_dims), convert to (num_query, bs, embed_dims)
+                    if output.shape[0] != query.shape[0] and output.shape[1] == query.shape[0]:
+                        output = output.permute(1, 0, 2)
+            
             current_value = value_lidar
 
             refined_view = None # 初始化 refined_view
@@ -470,6 +563,13 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     # Concat along channel dimension
                     cat_feat = torch.cat([value_lidar, value_view], dim=-1)
                     gate = self.gating_module(cat_feat)
+                    
+                    # [IMPROVED] Apply temperature scaling to control gate value distribution
+                    if self.gate_temperature != 1.0:
+                        # Temperature scaling: lower temperature = more conservative (lower gate values)
+                        # Formula: sigmoid((x - 0.5) / T + 0.5) where T is temperature
+                        gate = torch.sigmoid((gate - 0.5) / self.gate_temperature + 0.5)
+                    
                     refined_view = value_view * gate
                     gate_values = gate  # Save for visualization
 
@@ -505,17 +605,21 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     view_weight = float(lid) / float(num_layers - 1)
                     view_weight = min(max(view_weight, 0.0), 1.0)
                     
-                    # [FIX] Normalize weights to prevent feature magnitude explosion
-                    # Option 1: Keep lidar=1.0, scale view proportionally
-                    lidar_weight = 1.0
-                    # Option 2: Normalize so sum = 1.0 (alternative, commented out)
-                    # total_weight = lidar_weight + view_weight
-                    # lidar_weight = lidar_weight / total_weight
-                    # view_weight = view_weight / total_weight
-                    
-                    # Fused value: Lidar + Scaled View (Residual connection style)
+                    # [IMPROVED] Feature normalization + Normalized weights for better fusion
                     if value_lidar is not None:
-                        current_value = lidar_weight * value_lidar + view_weight * refined_view
+                        # 1. Feature Normalization: 确保两个模态的特征尺度匹配
+                        # 使用Layer Normalization，让每个样本的特征分布标准化
+                        lidar_norm = F.layer_norm(value_lidar, value_lidar.shape[-1:])
+                        view_norm = F.layer_norm(refined_view, refined_view.shape[-1:])
+                        
+                        # 2. Normalize weights: 确保权重和为1.0，防止特征幅度增大
+                        lidar_weight = 1.0
+                        total_weight = lidar_weight + view_weight
+                        lidar_weight = lidar_weight / total_weight
+                        view_weight = view_weight / total_weight
+                        
+                        # 3. Fused value: 使用归一化后的特征和权重
+                        current_value = lidar_weight * lidar_norm + view_weight * view_norm
                     else:
                         current_value = refined_view
                         
@@ -524,20 +628,184 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     if lid >= self.split_layer_index:
                         current_value = refined_view
             
-            # Update kwargs locally for this layer call
-            kwargs['value'] = current_value
+            # [NEW] Dual Cross Attention: Query attends to Lidar (main) and View (auxiliary) separately
+            if self.use_dual_cross_attn and value_view is not None and value_lidar is not None:
+                # [FIX] Ensure output is in correct shape (num_query, bs, embed_dims) for layer
+                # output should be (num_query, bs, embed_dims) at the start of each layer iteration
+                # Check and fix output shape if needed
+                if output.dim() == 3:
+                    num_query_expected = query.shape[0]  # Expected num_query dimension
+                    if output.shape[0] != num_query_expected:
+                        # If output is (bs, num_query, embed_dims), convert to (num_query, bs, embed_dims)
+                        if output.shape[1] == num_query_expected:
+                            output = output.permute(1, 0, 2)
+                        else:
+                            # Unexpected shape, try to infer
+                            raise RuntimeError(f"Unexpected output shape: {output.shape}, expected first dim to be {num_query_expected}")
+                
+                # Save original output for residual connection
+                output_orig = output
+                reference_points_input = reference_points[..., :2].unsqueeze(2)
+                view_mask = kwargs.get('view_mask', None)
+                
+                # [IMPROVED] Process Lidar first (main modality), then View (auxiliary)
+                if self.lidar_first:
+                    # Step 1: Query attends to Lidar features (main modality)
+                    kwargs_lidar = kwargs.copy()
+                    kwargs_lidar['value'] = value_lidar
+                    # [FIX] Remove key_padding_mask from kwargs to avoid duplicate argument
+                    kwargs_lidar.pop('key_padding_mask', None)
+                    
+                    output_lidar = layer(
+                        output,  # (num_query, bs, embed_dims)
+                        *args,
+                        reference_points=reference_points_input,
+                        key_padding_mask=key_padding_mask,  # Pass explicitly
+                        **kwargs_lidar)
+                    output_lidar = output_lidar.permute(1, 0, 2)  # (bs, num_query, embed_dims)
+                    
+                    # [NEW] Modality Interaction: Use Lidar output to guide View attention
+                    if self.use_modality_interaction:
+                        # Extract query features from Lidar output for interaction
+                        query_for_view = output_lidar  # (bs, num_query, embed_dims)
+                    else:
+                        query_for_view = output.permute(1, 0, 2)  # Original query
+                    
+                    # Step 2: Query attends to View features (auxiliary modality)
+                    kwargs_view = kwargs.copy()
+                    kwargs_view['value'] = refined_view if refined_view is not None else value_view
+                    # [FIX] Remove key_padding_mask from kwargs to avoid duplicate argument
+                    kwargs_view.pop('key_padding_mask', None)
+                    # Determine which mask to use
+                    view_key_padding_mask = view_mask if view_mask is not None else key_padding_mask
+                    
+                    # Use query_for_view (may be enhanced by Lidar output)
+                    output_view = layer(
+                        query_for_view.permute(1, 0, 2),  # Convert to (num_query, bs, embed_dims)
+                        *args,
+                        reference_points=reference_points_input,
+                        key_padding_mask=view_key_padding_mask,  # Pass explicitly
+                        **kwargs_view)
+                    output_view = output_view.permute(1, 0, 2)  # (bs, num_query, embed_dims)
+                else:
+                    # Original order: View first, then Lidar
+                    kwargs_view = kwargs.copy()
+                    kwargs_view['value'] = refined_view if refined_view is not None else value_view
+                    # [FIX] Remove key_padding_mask from kwargs to avoid duplicate argument
+                    kwargs_view.pop('key_padding_mask', None)
+                    view_key_padding_mask = view_mask if view_mask is not None else key_padding_mask
+                    
+                    output_view = layer(
+                        output,
+                        *args,
+                        reference_points=reference_points_input,
+                        key_padding_mask=view_key_padding_mask,  # Pass explicitly
+                        **kwargs_view)
+                    output_view = output_view.permute(1, 0, 2)
+                    
+                    kwargs_lidar = kwargs.copy()
+                    kwargs_lidar['value'] = value_lidar
+                    # [FIX] Remove key_padding_mask from kwargs to avoid duplicate argument
+                    kwargs_lidar.pop('key_padding_mask', None)
+                    
+                    output_lidar = layer(
+                        output_view.permute(1, 0, 2),
+                        *args,
+                        reference_points=reference_points_input,
+                        key_padding_mask=key_padding_mask,  # Pass explicitly
+                        **kwargs_lidar)
+                    output_lidar = output_lidar.permute(1, 0, 2)
+                
+                # Step 3: Fuse outputs from Lidar and View attention
+                # Normalize features before fusion
+                output_lidar_norm = F.layer_norm(output_lidar, output_lidar.shape[-1:])
+                output_view_norm = F.layer_norm(output_view, output_view.shape[-1:])
+                
+                # [NEW] Adaptive Weight Learning: Learn weights based on features
+                if self.use_adaptive_weights:
+                    # Concatenate normalized features to predict weights
+                    concat_feat = torch.cat([output_lidar_norm, output_view_norm], dim=-1)  # (bs, num_query, 2*embed_dims)
+                    # Average over query dimension to get global feature
+                    global_feat = concat_feat.mean(dim=1)  # (bs, 2*embed_dims)
+                    weights = self.adaptive_weight_module(global_feat)  # (bs, 2) -> [lidar_weight, view_weight]
+                    # Expand to match query dimension
+                    weights = weights.unsqueeze(1)  # (bs, 1, 2)
+                    lidar_weight = weights[..., 0:1]  # (bs, 1, 1)
+                    view_weight = weights[..., 1:2]  # (bs, 1, 1)
+                elif self.use_gradual:
+                    # Gradual fusion weights (layer-dependent)
+                    num_layers = len(self.layers)
+                    view_weight_val = float(lid) / float(num_layers - 1) if num_layers > 1 else 1.0
+                    view_weight_val = min(max(view_weight_val, 0.0), 1.0)
+                    lidar_weight_val = 1.0 - view_weight_val
+                    lidar_weight = lidar_weight_val
+                    view_weight = view_weight_val
+                else:
+                    # Fixed weights (favor Lidar as main modality)
+                    lidar_weight = 0.6
+                    view_weight = 0.4
+                
+                # [NEW] Conditional Fusion: Query-dependent modality gating
+                if self.use_conditional_fusion:
+                    # Use fused output (before final permute) to predict modality gates
+                    # output_lidar_norm and output_view_norm are both (bs, num_query, embed_dims)
+                    # Use their average or concatenation to get query representation
+                    query_flat = (output_lidar_norm + output_view_norm) / 2.0  # (bs, num_query, embed_dims)
+                    query_global = query_flat.mean(dim=1)  # (bs, embed_dims)
+                    modality_gates = self.conditional_fusion(query_global)  # (bs, 2) -> [lidar_gate, view_gate]
+                    lidar_gate = modality_gates[:, 0:1].unsqueeze(1)  # (bs, 1, 1)
+                    view_gate = modality_gates[:, 1:2].unsqueeze(1)  # (bs, 1, 1)
+                    
+                    # Apply gates to weights
+                    if isinstance(lidar_weight, float):
+                        lidar_weight = lidar_weight * lidar_gate
+                    else:
+                        lidar_weight = lidar_weight * lidar_gate
+                    if isinstance(view_weight, float):
+                        view_weight = view_weight * view_gate
+                    else:
+                        view_weight = view_weight * view_gate
+                    
+                    # Renormalize
+                    total_weight = lidar_weight + view_weight
+                    lidar_weight = lidar_weight / (total_weight + 1e-8)
+                    view_weight = view_weight / (total_weight + 1e-8)
+                
+                # Weighted fusion
+                if isinstance(lidar_weight, float):
+                    output = lidar_weight * output_lidar_norm + view_weight * output_view_norm
+                else:
+                    output = lidar_weight * output_lidar_norm + view_weight * output_view_norm
+                
+                # [NEW] Modality Interaction: Cross-modal enhancement
+                if self.use_modality_interaction and not self.lidar_first:
+                    # Enhance fused output with cross-modal interaction
+                    concat_output = torch.cat([output_lidar_norm, output_view_norm], dim=-1)
+                    interaction_feat = self.modality_interaction(concat_output)
+                    output = output + 0.1 * interaction_feat  # Residual connection with small weight
+                
+                # [FIX] output is currently (bs, num_query, embed_dims)
+                # Keep it as (bs, num_query, embed_dims) for reg_branches
+                # Then convert to (num_query, bs, embed_dims) for next layer
+            else:
+                # Original single cross attention (fused features)
+                # Update kwargs locally for this layer call
+                kwargs['value'] = current_value
 
-            reference_points_input = reference_points[..., :2].unsqueeze(2)  # BS NUM_QUERY NUM_LEVEL 2
-            
-            output = layer(
-                output,
-                *args,
-                reference_points=reference_points_input,
-                key_padding_mask=key_padding_mask,
-                **kwargs)
-            output = output.permute(1, 0, 2)
+                reference_points_input = reference_points[..., :2].unsqueeze(2)  # BS NUM_QUERY NUM_LEVEL 2
+                
+                output = layer(
+                    output,
+                    *args,
+                    reference_points=reference_points_input,
+                    key_padding_mask=key_padding_mask,
+                    **kwargs)
+                output = output.permute(1, 0, 2)  # (bs, num_query, embed_dims)
 
             if reg_branches is not None:
+                # [FIX] output should be (bs, num_query, embed_dims) for reg_branches
+                # In dual cross attention branch, output is already (bs, num_query, embed_dims)
+                # In single cross attention branch, output is (bs, num_query, embed_dims) after permute
                 tmp = reg_branches[lid](output)
 
                 assert reference_points.shape[-1] == 2
@@ -549,6 +817,10 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                 new_reference_points = new_reference_points.sigmoid()
 
                 reference_points = new_reference_points.detach()
+
+            # [FIX] Convert output to (num_query, bs, embed_dims) for next layer
+            # Both branches have output as (bs, num_query, embed_dims) at this point
+            output = output.permute(1, 0, 2)  # (num_query, bs, embed_dims)
 
             # [DEBUG ADDITION]
             if self.training:
@@ -573,9 +845,10 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                      input_view_img=kwargs.get('input_view_img', None)
                 )
 
-            output = output.permute(1, 0, 2)
+            # [FIX] output should be (num_query, bs, embed_dims) when appending to intermediate
+            # This matches the original decoder behavior
             if self.return_intermediate:
-                intermediate.append(output)
+                intermediate.append(output)  # output is already (num_query, bs, embed_dims)
                 intermediate_reference_points.append(reference_points)
 
         # [DEBUG ADDITION]

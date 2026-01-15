@@ -11,7 +11,7 @@ log_config = dict(
 # yapf:enable
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = "/homes/zhangzijian/vma_dev/train_result_/mapTR_lidar_res101_view_res101_crossattn_encoder_Gating_Dominant_Residual_fusion_gram_loss_0/"
+work_dir = "/homes/zhangzijian/vma_dev/train_result_/mapTR_lidar_res101_view_res101_query_crossattn_encoder_Gating_Adaptive_Conditional_fusion_gram_loss_0/"
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
@@ -226,6 +226,18 @@ model = dict(
                 split_layer_index=3,
                 num_layers=6,
                 return_intermediate=True,
+                # [NEW] Dual Cross Attention: Query attends to Lidar and View separately
+                use_dual_cross_attn=True,  # Enable dual cross attention
+                lidar_first=True,  # Process Lidar (main) first, then View (auxiliary)
+                # [NEW] Advanced fusion strategies
+                use_adaptive_weights=True,  # Learn fusion weights adaptively
+                use_modality_interaction=True,  # Enable cross-modal interaction
+                use_conditional_fusion=True,  # Query-dependent modality selection
+                # Existing options
+                use_gating=True,  # Gate View features based on Lidar
+                use_gradual=False,  # Disable gradual fusion when using adaptive weights
+                gate_temperature=0.8,  # Conservative gate values
+                embed_dims=_dim_,  # Required for adaptive modules
                 transformerlayers=dict(
                     type='DetrTransformerDecoderLayer',
                     attn_cfgs=[
