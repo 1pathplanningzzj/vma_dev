@@ -14,7 +14,7 @@ log_config = dict(
 # yapf:enable
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = "/homes/zhangzijian/vma_dev/train_result_/mapTR_lidar_res101_view_res101_query_crossattn_encoder_Gating_Adaptive_Conditional_fusion_gram_loss_0/"
+work_dir = "/homes/zhangzijian/vma_dev/train_result_/maptr_r101x2_dual-attn_fusion-GAC_gram0_fix_interpolate_res101/"
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
@@ -157,14 +157,14 @@ model = dict(
 
     img_backbone_view=dict(
         type='ResNet',
-        depth=34, 
+        depth=101,  # [CHANGED] Changed from ResNet-34 to ResNet-101 to match lidar backbone
         num_stages=4,
-        out_indices=(1,2,3,),
+        out_indices=(1, 2, 3),  # [CHANGED] Match lidar backbone format
         frozen_stages=1,
-        norm_cfg=dict(type='BN', requires_grad=False),
+        norm_cfg=dict(type='BN', requires_grad=True),  # [FIX] Changed from False to True: allow BN to adapt to View data distribution
         norm_eval=True,
         style='pytorch',
-        pretrained='/homes/zhangzijian/vma-dev/ckpts/resnet34-333f7ec4.pth'
+        pretrained='/homes/zhangzijian/vma-dev/ckpts/resnet101-5d3b4d8f.pth'  # [CHANGED] ResNet-101 pretrained weights
         ),
 
     img_neck=dict(
@@ -178,7 +178,7 @@ model = dict(
 
     img_neck_view=dict(
         type='ChannelMapper',
-        in_channels=[128, 256, 512],          
+        in_channels=[512, 1024, 2048],  # [CHANGED] Match ResNet-101 output channels (was [128, 256, 512] for ResNet-34)
         kernel_size=1,
         out_channels=256,
         act_cfg=None,
