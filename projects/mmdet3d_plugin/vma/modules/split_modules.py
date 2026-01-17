@@ -36,6 +36,11 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                  gate_temperature=1.0,  # [FIX] Add as explicit parameter
                  embed_dims=256,  # [FIX] Add as explicit parameter
                  use_adaptive_gating=True,  # [NEW] 是否启用基于空间方差的动态Gating
+                 # [PRIORITY 1] 空间对齐参数
+                 use_spatial_alignment=True,  # 启用显式空间对齐模块
+                 alignment_loss_weight=0.1,  # 对比对齐损失权重
+                 # [PRIORITY 2] 门控损失权重
+                 gate_loss_weight=0.01,  # 门控正则化损失权重
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.split_layer_index = split_layer_index
@@ -49,6 +54,11 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         self.lidar_first = lidar_first  # Lidar is main modality, process first
         self.gate_temperature = gate_temperature  # [FIX] Store gate_temperature
         self.use_adaptive_gating = use_adaptive_gating  # [NEW] 是否启用基于空间方差的动态Gating
+        # [PRIORITY 1] 空间对齐参数
+        self.use_spatial_alignment = use_spatial_alignment
+        self.alignment_loss_weight = alignment_loss_weight
+        # [PRIORITY 2] 门控损失权重
+        self.gate_loss_weight = gate_loss_weight
         
         # [FIX] Get embed_dims from kwargs if provided, otherwise use parameter value
         if 'embed_dims' in kwargs:
@@ -74,9 +84,11 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     if idx == len(linear_layers) - 1:  # Last Linear layer (before Softmax)
-                        # Bias to favor Lidar: [lidar_bias, view_bias] = [1.0, -1.0]
+                        # [FIX] 使用更弱的bias，让初始权重更平衡
+                        # 问题：bias [1.0, -1.0] 导致初始权重 [0.88, 0.12]，太极端，模型难以学习平衡
+                        # 解决：改为 [0.3, -0.3]，初始权重约为 [0.65, 0.35]，更接近期望的平衡状态
                         with torch.no_grad():
-                            m.bias.data = torch.tensor([1.0, -1.0], dtype=m.bias.dtype, device=m.bias.device)
+                            m.bias.data = torch.tensor([0.3, -0.3], dtype=m.bias.dtype, device=m.bias.device)
                     else:
                         nn.init.constant_(m.bias, 0)
         
@@ -110,36 +122,75 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
 
         # [DEBUG ADDITION]
         self.debug_step = 0
-        self.debug_dir = "debug_vis_gt_mask_5/attention_check"
+        self.debug_dir = "debug_vis_gt_mask_6/attention_check"
         try:
             os.makedirs(self.debug_dir, exist_ok=True)
         except Exception:
             pass
         
-        # Gating module: Learn to filter view features based on lidar features
-        if self.use_gating:
-            # embed_dims is already set above from parameter or kwargs
-            self.gating_module = nn.Sequential(
-                nn.Linear(embed_dims * 2, embed_dims),
-                nn.ReLU(inplace=True),
-                nn.Linear(embed_dims, embed_dims),
-                nn.Sigmoid()
+        # [PRIORITY 1] Spatial Alignment Module: Explicitly align View features to Lidar
+        # use_spatial_alignment and alignment_loss_weight are now parameters (set above)
+        if self.use_spatial_alignment:
+            # [NEW] 使用Cross-Attention进行空间对齐
+            # LiDAR作为query，View作为key/value，学习空间对应关系
+            # 这样可以让模型学习"LiDAR特征应该对应View特征的哪个位置"
+            self.spatial_alignment_attn = nn.MultiheadAttention(
+                embed_dim=embed_dims,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True  # (BS, Num_Keys, C)
             )
+            self.alignment_norm = nn.LayerNorm(embed_dims)
+            self.alignment_ffn = nn.Sequential(
+                nn.Linear(embed_dims, embed_dims * 2),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims * 2, embed_dims)
+            )
+            self.alignment_ffn_norm = nn.LayerNorm(embed_dims)
             
-            # [IMPROVED] Gate temperature is already set as self.gate_temperature above
-
-            # Initialize weights with conservative bias
-            # [IMPROVED] Make initial gate values more conservative
-            # Find the last Linear layer (before Sigmoid) and set negative bias
-            linear_layers = [m for m in self.gating_module.modules() if isinstance(m, nn.Linear)]
-            for idx, m in enumerate(linear_layers):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    if idx == len(linear_layers) - 1:  # Last Linear layer (before Sigmoid)
-                        # Set negative bias to make initial gate values smaller
-                        nn.init.constant_(m.bias, -1.0)  # Initial gate ≈ 0.27
-                    else:
+            # Initialize alignment modules
+            # [FIX] 改进初始化：使用更小的初始化，避免初始输出过大
+            for m in self.alignment_ffn.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.1)  # 使用较小的gain
+                    if m.bias is not None:
                         nn.init.constant_(m.bias, 0)
+            
+            # [FIX] 初始化Cross-Attention：使用更小的初始化
+            for m in self.spatial_alignment_attn.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.1)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+        
+        # Gating module: Learn to filter view features based on lidar features
+        # [PRIORITY 2] Layer-specific gating: each layer has its own gating module
+        # gate_loss_weight is now a parameter (set above)
+        if self.use_gating:
+            # Get num_layers from kwargs or use default
+            num_layers = kwargs.get('num_layers', 6)  # Default to 6 layers
+            # [PRIORITY 2] Create layer-specific gating modules
+            num_layers = kwargs.get('num_layers', 6)  # Default to 6 layers
+            self.gating_modules = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(embed_dims * 2, embed_dims),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(embed_dims, embed_dims),
+                    # [FIX] Removed nn.Sigmoid() - will apply sigmoid with temperature scaling in forward
+                ) for _ in range(num_layers)
+            ])
+            
+            # Initialize each layer's gating module with conservative bias
+            for gating_module in self.gating_modules:
+                linear_layers = [m for m in gating_module.modules() if isinstance(m, nn.Linear)]
+                for idx, m in enumerate(linear_layers):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        if idx == len(linear_layers) - 1:  # Last Linear layer
+                            # Set negative bias to make initial gate values smaller
+                            nn.init.constant_(m.bias, -1.0)  # Initial gate ≈ 0.27 after sigmoid
+                        else:
+                            nn.init.constant_(m.bias, 0)
 
     # [DEBUG ADDITION]
     def visualize_reference_points(self, reference_points, layer_idx, img_metas=None, feature_map=None, feature_map_view=None, spatial_shapes=None, gt_bboxes_3d=None, gate_values=None, fused_feature=None, view_mask=None, input_lidar_img=None, input_view_img=None):
@@ -1134,9 +1185,17 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         # Capture the primary value (usually lidar) from kwargs
         value_lidar = kwargs.get('value', None)
         
+        # [PRIORITY 2] Initialize loss accumulators for this forward pass
+        if self.training:
+            self._gate_losses = []
+            # [REMOVED] 删除对齐损失：对比损失不work，只保留Cross-Attention对齐模块
+            # self._alignment_losses = []
+        
         for lid, layer in enumerate(self.layers):
             # [FIX] Ensure output is in correct shape (num_query, bs, embed_dims) at start of each iteration
             # output should be (num_query, bs, embed_dims) for layer input
+            # [PRIORITY 2] Pass layer index to kwargs for layer-specific gating
+            kwargs['layer_idx'] = lid
             if lid > 0:  # After first layer, output might have been permuted
                 # Check if output needs to be converted back to (num_query, bs, embed_dims)
                 if output.dim() == 3:
@@ -1150,28 +1209,124 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
             gate_values = None
             fused_feature_for_vis = None  # 用于可视化的 BEV 融合特征
             if value_view is not None:
-                # 1. Gating / Noise Filtering
-                refined_view = value_view
+                # [PRIORITY 1] Step 1: Spatial Alignment - Align View features to Lidar before fusion
+                aligned_view = value_view
+                alignment_loss = None
+                if self.use_spatial_alignment and value_lidar is not None:
+                    # [NEW] Cross-Attention对齐：LiDAR作为query，View作为key/value
+                    # value_lidar: (BS, Num_Keys, C)
+                    # value_view: (BS, Num_Keys, C)
+                    # 让LiDAR特征去"查询"View特征中对应的空间位置，学习空间对应关系
+                    
+                    # Cross-attention: query=LiDAR, key=value=View
+                    # [FIX] 添加位置编码（如果有）来帮助学习空间对应关系
+                    # 注意：这里假设value_lidar和value_view已经有位置信息（通过encoder）
+                    attn_output, attn_weights = self.spatial_alignment_attn(
+                        query=value_lidar,      # LiDAR特征作为query
+                        key=value_view,         # View特征作为key
+                        value=value_view,       # View特征作为value
+                        need_weights=False
+                    )
+                    
+                    # [FIX] 进一步弱化残差连接，让对齐效果更明显
+                    # 问题：如果残差太强，模型可能直接使用原始View特征，而不学习对齐
+                    # 解决：进一步降低残差权重（从0.8/0.2改为0.7/0.3，或者完全移除残差）
+                    aligned_view = self.alignment_norm(attn_output)
+                    # [FIX] 恢复残差连接，保留View特征的空间结构
+                    # 问题：完全移除残差连接会导致View特征变uniform（空间结构丢失）
+                    # 解决：使用50/50 blend，平衡对齐学习和空间结构保留
+                    aligned_view = 0.5 * aligned_view + 0.5 * value_view  # 50/50 blend
+                    
+                    # FFN增强：进一步处理对齐后的特征
+                    ffn_output = self.alignment_ffn(aligned_view)
+                    aligned_view = self.alignment_ffn_norm(ffn_output + aligned_view)
+                    
+                    # [PRIORITY 1 FIX] Magnitude对齐：scale到与Lidar相同的magnitude范围
+                    # 问题：Lidar和View的magnitude分布差异很大，导致融合不稳定
+                    # 解决：在对齐后normalize magnitude，确保两个模态的特征在相同的magnitude范围内
+                    # [FIX] 检查View特征是否被过度normalize：如果magnitude已经对齐（scale≈1.0），跳过对齐
+                    with torch.no_grad():
+                        # 计算Lidar和View的平均magnitude
+                        lidar_magnitude = value_lidar.norm(dim=-1, keepdim=True).mean()  # (1,)
+                        aligned_view_magnitude = aligned_view.norm(dim=-1, keepdim=True).mean()  # (1,)
+                        # 计算magnitude scale factor
+                        magnitude_scale = lidar_magnitude / (aligned_view_magnitude + 1e-8)
+                        # [DEBUG] 监控magnitude对齐效果
+                        if self.training and self.debug_step % 1000 == 0:
+                            print(f"[MAGNITUDE ALIGN] Step {self.debug_step}, Layer {lid}: "
+                                  f"lidar_mag={lidar_magnitude.item():.4f}, "
+                                  f"view_mag={aligned_view_magnitude.item():.4f}, "
+                                  f"scale={magnitude_scale.item():.4f}")
+                        # [PRIORITY 1 FIX] 如果View特征magnitude已经很小（可能被过度normalize），增强View特征
+                        # 如果View特征magnitude < Lidar特征magnitude的50%，说明View特征可能被过度抑制
+                        if aligned_view_magnitude < lidar_magnitude * 0.5:
+                            # 增强View特征：将magnitude scale限制在合理范围内，避免过度放大
+                            magnitude_scale = torch.clamp(magnitude_scale, min=0.5, max=2.0)
+                            if self.training and self.debug_step % 1000 == 0:
+                                print(f"[VIEW ENHANCE] Step {self.debug_step}, Layer {lid}: "
+                                      f"View magnitude too low, applying enhanced scale={magnitude_scale.item():.4f}")
+                    # 应用magnitude scale
+                    aligned_view = aligned_view * magnitude_scale
+                    
+                    # [REMOVED] 删除对比对齐损失：损失不work（pos_sim == neg_sim），只保留Cross-Attention对齐模块
+                    # Cross-Attention对齐模块仍然会学习空间对应关系，通过主检测损失的反向传播
+                    # 如果需要在训练时监控对齐效果，可以添加调试信息（但不计算损失）
+                    if self.training and self.debug_step % 1000 == 0:
+                        # [DEBUG] 可选：打印对齐效果（不计算损失）
+                        with torch.no_grad():
+                            # 计算对齐后的相似度（用于监控，不用于损失）
+                            alignment_sim = F.cosine_similarity(value_lidar, aligned_view, dim=-1).mean()
+                            # [FIX] 修复方差计算：计算每个特征向量在通道维度上的方差（空间方差）
+                            # 特征形状：(BS, Num_Keys, C)
+                            # var(dim=-1) -> (BS, Num_Keys) 每个位置的特征向量在通道维度上的方差
+                            # mean() -> scalar 所有位置的平均方差
+                            view_spatial_var = aligned_view.var(dim=-1, unbiased=False).mean()
+                            lidar_spatial_var = value_lidar.var(dim=-1, unbiased=False).mean()
+                            
+                            # 处理NaN
+                            if torch.isnan(view_spatial_var):
+                                view_spatial_var = torch.tensor(0.0, device=aligned_view.device)
+                            if torch.isnan(lidar_spatial_var):
+                                lidar_spatial_var = torch.tensor(0.0, device=value_lidar.device)
+                            
+                            print(f"[ALIGNMENT DEBUG] Step {self.debug_step}, Layer {lid}: "
+                                  f"alignment_sim={alignment_sim.item():.4f}, "
+                                  f"view_var={view_spatial_var.item():.4f}, lidar_var={lidar_spatial_var.item():.4f}")
+                
+                # 1. Gating / Noise Filtering (now operates on aligned features)
+                refined_view = aligned_view
                 if self.use_gating and value_lidar is not None:
                      # ... existing gating logig ...
                     # value_lidar: (BS, Num_Keys, C)
-                    # value_view: (BS, Num_Keys, C)
+                    # aligned_view: (BS, Num_Keys, C) - now using aligned View features
                     # Concat along channel dimension
-                    cat_feat = torch.cat([value_lidar, value_view], dim=-1)
-                    gate = self.gating_module(cat_feat)
+                    cat_feat = torch.cat([value_lidar, aligned_view], dim=-1)
+                    # [PRIORITY 2] Use layer-specific gating module
+                    layer_idx = kwargs.get('layer_idx', 0)  # Get current layer index
+                    if hasattr(self, 'gating_modules') and layer_idx < len(self.gating_modules):
+                        gate_logits = self.gating_modules[layer_idx](cat_feat)  # [FIX] Layer-specific gating
+                    else:
+                        # Fallback to single gating module if layer-specific not available
+                        gate_logits = self.gating_module(cat_feat) if hasattr(self, 'gating_module') else cat_feat.mean(dim=-1, keepdim=True)
                     
-                    # [IMPROVED] Apply temperature scaling to control gate value distribution
+                    # [PRIORITY 2 FIX] Apply temperature-scaled sigmoid (only once, not double sigmoid)
+                    # [FIX] Removed double sigmoid: gating_module no longer has Sigmoid, so we apply it here with temperature
                     if self.gate_temperature != 1.0:
                         # Temperature scaling: lower temperature = more conservative (lower gate values)
-                        # Formula: sigmoid((x - 0.5) / T + 0.5) where T is temperature
-                        gate = torch.sigmoid((gate - 0.5) / self.gate_temperature + 0.5)
+                        gate = torch.sigmoid(gate_logits / self.gate_temperature)
+                    else:
+                        gate = torch.sigmoid(gate_logits)
+                    
+                    # [PRIORITY 2] Add gate regularization loss (encourage lower gate values and spatial selectivity)
+                    gate_sparsity_loss = gate.mean()  # Encourage lower gate values
+                    gate_variance_loss = -gate.var()  # Encourage spatial selectivity (higher variance)
                     
                     # [NEW] 更激进的Gating策略：当View特征缺乏空间区分度时，降低gate值
                     # 检测View特征的空间方差（如果方差小，说明特征uniform，应该降低gate）
                     if self.use_adaptive_gating:
                         with torch.no_grad():
                             # 计算每个样本的空间方差（在空间维度H*W上计算方差）
-                            view_spatial_var = value_view.var(dim=1).mean()  # 计算空间维度的方差
+                            view_spatial_var = aligned_view.var(dim=1).mean()  # [FIX] Use aligned_view instead of value_view
                             # 如果方差小（<0.1），说明特征uniform（"一片黄色"），应该更保守地使用View
                             if view_spatial_var < 0.1:
                                 # 降低gate值，更激进地过滤View特征
@@ -1180,7 +1335,21 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                                 if self.training and self.debug_step % 1000 == 0:
                                     print(f"[ADAPTIVE GATING] Step {self.debug_step}: View spatial_var={view_spatial_var:.4f} < 0.1, reducing gate by 50%")
                     
-                    refined_view = value_view * gate
+                    # [PRIORITY 2 FIX] 确保View特征有最小贡献，防止View Mask完全黑色
+                    # 问题：门控机制可能过于保守，导致View特征被完全mask掉
+                    # 解决：提高最小gate值，确保View特征有更大贡献（从0.1提高到0.25）
+                    min_gate_value = 0.25  # [FIX] 从0.1提高到0.25，确保View特征有更大贡献
+                    gate = torch.clamp(gate, min=min_gate_value, max=1.0)
+                    
+                    refined_view = aligned_view * gate  # [FIX] Use aligned_view instead of value_view
+                    
+                    # [PRIORITY 2] Store gate losses for later aggregation (will be added to total loss)
+                    if not hasattr(self, '_gate_losses'):
+                        self._gate_losses = []
+                    self._gate_losses.append({
+                        'sparsity': gate_sparsity_loss,
+                        'variance': gate_variance_loss
+                    })
                     gate_values = gate  # Save for visualization
 
                 # 为了诊断方便，在 BEV 空间上构造一个简单的“融合特征”用于可视化
@@ -1412,6 +1581,17 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                         lidar_weight = weights[..., 0:1]
                         view_weight = weights[..., 1:2]
                         
+                        # [PRIORITY 3 FIX] 防止Lidar过度主导，强制权重平衡
+                        # 问题：自适应权重学习可能过度偏向Lidar（0.7-0.75 vs 0.2-0.25）
+                        # 解决：缩小权重范围到[0.4, 0.6]，强制更平衡的融合
+                        lidar_weight = torch.clamp(lidar_weight, min=0.4, max=0.6)  # [FIX] 从[0.3, 0.7]缩小到[0.4, 0.6]
+                        view_weight = 1.0 - lidar_weight  # 确保权重和为1.0
+                        # [DEBUG] 监控权重平衡效果
+                        if self.training and self.debug_step % 1000 == 0:
+                            print(f"[WEIGHT BALANCE] Step {self.debug_step}, Layer {lid}: "
+                                  f"lidar_weight={lidar_weight.mean().item():.4f} (range: [{lidar_weight.min().item():.4f}, {lidar_weight.max().item():.4f}]), "
+                                  f"view_weight={view_weight.mean().item():.4f} (range: [{view_weight.min().item():.4f}, {view_weight.max().item():.4f}])")
+                        
                         # [NEW] 可视化自适应融合权重
                         if self.training:
                             self.visualize_adaptive_weights(
@@ -1476,7 +1656,19 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     # 融合后：fused_cross = lidar_weight * output_lidar + view_weight * output_view
                     # 这个fused_cross已经包含了residual，现在统一归一化（避免双重归一化）
                     # 融合前如果做了归一化，仅用于权重计算，融合使用原始特征
+                    
+                    # [PRIORITY 3] Check normalization initialization (debug mode)
+                    if self.training and self.debug_step % 5000 == 0 and lid == 0:
+                        norm_weight = layer.norms[1].weight.data[:3] if hasattr(layer.norms[1], 'weight') else None
+                        norm_bias = layer.norms[1].bias.data[:3] if hasattr(layer.norms[1], 'bias') else None
+                        print(f"[NORM CHECK] Step {self.debug_step}, Layer {lid}: norm[1] weight={norm_weight}, bias={norm_bias}")
+                        print(f"  fused_cross before norm: mean={fused_cross.mean():.4f}, std={fused_cross.std():.4f}")
+                    
                     output = layer.norms[1](fused_cross)
+                    
+                    # [PRIORITY 3] Check normalization output (debug mode)
+                    if self.training and self.debug_step % 5000 == 0 and lid == 0:
+                        print(f"  output after norm: mean={output.mean():.4f}, std={output.std():.4f}")
                     identity = output  # 更新identity用于FFN
 
                 # Step 4: FFN (只执行一次)
@@ -1593,11 +1785,47 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         if self.training:
             self.debug_step += 1
 
+        # [PRIORITY 2] Aggregate and store losses for later retrieval
+        if self.training:
+            # [REMOVED] 删除对齐损失聚合：对比损失不work，只保留Cross-Attention对齐模块
+            # Aggregate alignment losses
+            # if hasattr(self, '_alignment_losses') and len(self._alignment_losses) > 0:
+            #     total_alignment_loss = sum(self._alignment_losses) / len(self._alignment_losses)
+            #     self._total_alignment_loss = total_alignment_loss * self.alignment_loss_weight
+            # else:
+            #     self._total_alignment_loss = None
+            
+            # Aggregate gate losses
+            if hasattr(self, '_gate_losses') and len(self._gate_losses) > 0:
+                total_gate_sparsity = sum([g['sparsity'] for g in self._gate_losses]) / len(self._gate_losses)
+                total_gate_variance = sum([g['variance'] for g in self._gate_losses]) / len(self._gate_losses)
+                self._total_gate_sparsity_loss = total_gate_sparsity * self.gate_loss_weight
+                self._total_gate_variance_loss = total_gate_variance * self.gate_loss_weight
+            else:
+                self._total_gate_sparsity_loss = None
+                self._total_gate_variance_loss = None
+        
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(
                 intermediate_reference_points)
 
         return output, reference_points
+    
+    def get_fusion_losses(self):
+        """
+        [PRIORITY 2] Get fusion-related losses (gating losses only)
+        [REMOVED] 对齐损失已删除：对比损失不work，只保留Cross-Attention对齐模块
+        Returns a dictionary of losses that should be added to the main loss dict
+        """
+        loss_dict = {}
+        # [REMOVED] 删除对齐损失
+        # if hasattr(self, '_total_alignment_loss') and self._total_alignment_loss is not None:
+        #     loss_dict['loss_alignment'] = self._total_alignment_loss
+        if hasattr(self, '_total_gate_sparsity_loss') and self._total_gate_sparsity_loss is not None:
+            loss_dict['loss_gate_sparsity'] = self._total_gate_sparsity_loss
+        if hasattr(self, '_total_gate_variance_loss') and self._total_gate_variance_loss is not None:
+            loss_dict['loss_gate_variance'] = self._total_gate_variance_loss
+        return loss_dict
 
 
 @TRANSFORMER.register_module()
