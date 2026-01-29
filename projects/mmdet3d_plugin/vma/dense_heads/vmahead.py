@@ -266,6 +266,7 @@ class VMAHead(DETRHead):
             for i, f in enumerate(mlvl_feats):
                 if f.shape[2] <= 1 or f.shape[3] <= 1:
                      print(f"[ERROR] Lidar Feature Level {i} Collapse! Shape: {f.shape}")
+
                 # else:
                 #      print(f"[INFO] Lidar Level {i} Shape: {f.shape}")
 

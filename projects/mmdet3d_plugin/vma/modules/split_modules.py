@@ -1,3 +1,15 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+import cv2  # 用于热力图平滑和缩放
+from mmdet.models.utils.builder import TRANSFORMER
+from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
+from mmdet.models.utils.transformer import DeformableDetrTransformer, inverse_sigmoid
+from mmcv.cnn.bricks.transformer import build_transformer_layer_sequence
+from .decoder import VMADetectionTransformerDecoder
 # date 2026-01-15
 # author: zijian
 # email: zhangzijian@trunk.tech
@@ -7,24 +19,6 @@
 # It is also used to predict the bounding boxes of the objects.
 # It is also used to predict the classes of the objects.
 # It is also used to predict the scores of the objects.
-
-import os
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import numpy as np
-import cv2  # 用于热力图平滑和缩放
-try:
-    from scipy.spatial.distance import cdist
-except ImportError:
-    cdist = None  # 如果scipy不可用，可视化时会跳过相关功能
-from mmdet.models.utils.builder import TRANSFORMER
-from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
-from mmdet.models.utils.transformer import DeformableDetrTransformer, inverse_sigmoid
-from mmcv.cnn.bricks.transformer import build_transformer_layer_sequence
-from .decoder import VMADetectionTransformerDecoder
-
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
 class SplitModalityDecoder(VMADetectionTransformerDecoder):
     def __init__(self, *args, split_layer_index=3, use_gating=True, use_gradual=True, 
@@ -35,12 +29,6 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                  lidar_first=True,  # [NEW] Lidar first (main modality), then View (auxiliary)
                  gate_temperature=1.0,  # [FIX] Add as explicit parameter
                  embed_dims=256,  # [FIX] Add as explicit parameter
-                 use_adaptive_gating=True,  # [NEW] 是否启用基于空间方差的动态Gating
-                 # [PRIORITY 1] 空间对齐参数
-                 use_spatial_alignment=True,  # 启用显式空间对齐模块
-                 alignment_loss_weight=0.1,  # 对比对齐损失权重
-                 # [PRIORITY 2] 门控损失权重
-                 gate_loss_weight=0.01,  # 门控正则化损失权重
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.split_layer_index = split_layer_index
@@ -53,29 +41,18 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         self.use_conditional_fusion = use_conditional_fusion
         self.lidar_first = lidar_first  # Lidar is main modality, process first
         self.gate_temperature = gate_temperature  # [FIX] Store gate_temperature
-        self.use_adaptive_gating = use_adaptive_gating  # [NEW] 是否启用基于空间方差的动态Gating
-        # [PRIORITY 1] 空间对齐参数
-        self.use_spatial_alignment = use_spatial_alignment
-        self.alignment_loss_weight = alignment_loss_weight
-        # [PRIORITY 2] 门控损失权重
-        self.gate_loss_weight = gate_loss_weight
         
         # [FIX] Get embed_dims from kwargs if provided, otherwise use parameter value
         if 'embed_dims' in kwargs:
             embed_dims = kwargs.pop('embed_dims')  # Use kwargs value and remove it
         # Otherwise use the parameter value (already set as embed_dims=256)
         
-        # [NEW] Adaptive weight learning module (per-query spatial adaptive)
+        # [NEW] Adaptive weight learning module
         if self.use_adaptive_weights:
-            # [FIX] Changed to per-query prediction instead of global
             self.adaptive_weight_module = nn.Sequential(
                 nn.Linear(embed_dims * 2, embed_dims),
-                nn.LayerNorm(embed_dims),  # [FIX] Add LayerNorm for stability
                 nn.ReLU(inplace=True),
-                nn.Linear(embed_dims, embed_dims // 2),
-                nn.LayerNorm(embed_dims // 2),  # [FIX] Add LayerNorm for stability
-                nn.ReLU(inplace=True),
-                nn.Linear(embed_dims // 2, 2),  # Output: [lidar_weight, view_weight] per query
+                nn.Linear(embed_dims, 2),  # Output: [lidar_weight, view_weight]
                 nn.Softmax(dim=-1)  # Ensure weights sum to 1.0
             )
             # Initialize to favor Lidar (main modality)
@@ -84,11 +61,9 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     if idx == len(linear_layers) - 1:  # Last Linear layer (before Softmax)
-                        # [FIX] 使用更弱的bias，让初始权重更平衡
-                        # 问题：bias [1.0, -1.0] 导致初始权重 [0.88, 0.12]，太极端，模型难以学习平衡
-                        # 解决：改为 [0.3, -0.3]，初始权重约为 [0.65, 0.35]，更接近期望的平衡状态
+                        # Bias to favor Lidar: [lidar_bias, view_bias] = [1.0, -1.0]
                         with torch.no_grad():
-                            m.bias.data = torch.tensor([0.3, -0.3], dtype=m.bias.dtype, device=m.bias.device)
+                            m.bias.data = torch.tensor([1.0, -1.0], dtype=m.bias.dtype, device=m.bias.device)
                     else:
                         nn.init.constant_(m.bias, 0)
         
@@ -122,75 +97,36 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
 
         # [DEBUG ADDITION]
         self.debug_step = 0
-        self.debug_dir = "debug_vis_gt_mask_6/attention_check"
+        self.debug_dir = "debug_vis_gt_mask_5/attention_check"
         try:
             os.makedirs(self.debug_dir, exist_ok=True)
         except Exception:
             pass
         
-        # [PRIORITY 1] Spatial Alignment Module: Explicitly align View features to Lidar
-        # use_spatial_alignment and alignment_loss_weight are now parameters (set above)
-        if self.use_spatial_alignment:
-            # [NEW] 使用Cross-Attention进行空间对齐
-            # LiDAR作为query，View作为key/value，学习空间对应关系
-            # 这样可以让模型学习"LiDAR特征应该对应View特征的哪个位置"
-            self.spatial_alignment_attn = nn.MultiheadAttention(
-                embed_dim=embed_dims,
-                num_heads=8,
-                dropout=0.1,
-                batch_first=True  # (BS, Num_Keys, C)
-            )
-            self.alignment_norm = nn.LayerNorm(embed_dims)
-            self.alignment_ffn = nn.Sequential(
-                nn.Linear(embed_dims, embed_dims * 2),
-                nn.ReLU(inplace=True),
-                nn.Linear(embed_dims * 2, embed_dims)
-            )
-            self.alignment_ffn_norm = nn.LayerNorm(embed_dims)
-            
-            # Initialize alignment modules
-            # [FIX] 改进初始化：使用更小的初始化，避免初始输出过大
-            for m in self.alignment_ffn.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.1)  # 使用较小的gain
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
-            
-            # [FIX] 初始化Cross-Attention：使用更小的初始化
-            for m in self.spatial_alignment_attn.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.1)
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
-        
         # Gating module: Learn to filter view features based on lidar features
-        # [PRIORITY 2] Layer-specific gating: each layer has its own gating module
-        # gate_loss_weight is now a parameter (set above)
         if self.use_gating:
-            # Get num_layers from kwargs or use default
-            num_layers = kwargs.get('num_layers', 6)  # Default to 6 layers
-            # [PRIORITY 2] Create layer-specific gating modules
-            num_layers = kwargs.get('num_layers', 6)  # Default to 6 layers
-            self.gating_modules = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(embed_dims * 2, embed_dims),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(embed_dims, embed_dims),
-                    # [FIX] Removed nn.Sigmoid() - will apply sigmoid with temperature scaling in forward
-                ) for _ in range(num_layers)
-            ])
+            # embed_dims is already set above from parameter or kwargs
+            self.gating_module = nn.Sequential(
+                nn.Linear(embed_dims * 2, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, embed_dims),
+                nn.Sigmoid()
+            )
             
-            # Initialize each layer's gating module with conservative bias
-            for gating_module in self.gating_modules:
-                linear_layers = [m for m in gating_module.modules() if isinstance(m, nn.Linear)]
-                for idx, m in enumerate(linear_layers):
-                    nn.init.xavier_uniform_(m.weight)
-                    if m.bias is not None:
-                        if idx == len(linear_layers) - 1:  # Last Linear layer
-                            # Set negative bias to make initial gate values smaller
-                            nn.init.constant_(m.bias, -1.0)  # Initial gate ≈ 0.27 after sigmoid
-                        else:
-                            nn.init.constant_(m.bias, 0)
+            # [IMPROVED] Gate temperature is already set as self.gate_temperature above
+
+            # Initialize weights with conservative bias
+            # [IMPROVED] Make initial gate values more conservative
+            # Find the last Linear layer (before Sigmoid) and set negative bias
+            linear_layers = [m for m in self.gating_module.modules() if isinstance(m, nn.Linear)]
+            for idx, m in enumerate(linear_layers):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    if idx == len(linear_layers) - 1:  # Last Linear layer (before Sigmoid)
+                        # Set negative bias to make initial gate values smaller
+                        nn.init.constant_(m.bias, -1.0)  # Initial gate ≈ 0.27
+                    else:
+                        nn.init.constant_(m.bias, 0)
 
     # [DEBUG ADDITION]
     def visualize_reference_points(self, reference_points, layer_idx, img_metas=None, feature_map=None, feature_map_view=None, spatial_shapes=None, gt_bboxes_3d=None, gate_values=None, fused_feature=None, view_mask=None, input_lidar_img=None, input_view_img=None):
@@ -398,6 +334,33 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     gate_values, view_mask, spatial_shapes, gt_bboxes_3d
                 )
             
+            # [NEW] Additional visualizations
+            # 1. Feature comparison visualization
+            if feature_map is not None and feature_map_view is not None:
+                self.visualize_feature_comparison(
+                    reference_points, layer_idx,
+                    feature_map, feature_map_view, fused_feature,
+                    spatial_shapes, gt_bboxes_3d
+                )
+            
+            # 2. Adaptive weights visualization (if using adaptive weights)
+            if self.use_adaptive_weights and hasattr(self, '_last_adaptive_weights'):
+                self.visualize_adaptive_weights(
+                    reference_points, layer_idx,
+                    self._last_adaptive_weights, spatial_shapes
+                )
+            
+            # 3. Cross-attention visualization
+            if feature_map is not None or feature_map_view is not None:
+                # Get query from current output (approximate)
+                query_for_vis = None
+                if hasattr(self, '_last_query'):
+                    query_for_vis = self._last_query
+                self.visualize_cross_attention(
+                    reference_points, layer_idx,
+                    query_for_vis, feature_map, feature_map_view, spatial_shapes
+                )
+            
         except Exception as e:
             print(f"Vis error: {e}")
 
@@ -470,24 +433,12 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     status = "No input"
                 return feat_img, status
             
-            # 动态确定需要的子图数量，避免出现未使用的空白坐标轴
-            num_plots = 0
-            has_gate_plot = gate_values is not None
-            has_view_mask_plot = view_mask is not None
-            has_fused_plot = fused_feature is not None
-
-            if has_gate_plot:
+            num_plots = 2
+            if gate_values is not None:
                 num_plots += 1
-            if has_view_mask_plot:
+            if view_mask is not None:
                 num_plots += 1
-            if has_fused_plot:
-                num_plots += 1
-
-            # 统计信息单独占一个子图（只要有任意一种特征存在就画）
-            has_stats_plot = (feature_map_lidar is not None) or \
-                             (feature_map_view is not None) or \
-                             (fused_feature is not None)
-            if has_stats_plot:
+            if fused_feature is not None:
                 num_plots += 1
                 
             fig, axes = plt.subplots(1, num_plots, figsize=(6*num_plots, 6))
@@ -567,18 +518,23 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                         plot_idx += 1
             
             # Plot 4: Feature Statistics
+            # [FIX] Calculate statistics based on feature vector L2 norms, not raw feature values
             stats_text = []
             if feature_map_lidar is not None:
-                lidar_mean = feature_map_lidar.mean().item()
-                lidar_std = feature_map_lidar.std().item()
+                # Compute L2 norm for each feature vector: (BS, Num_Keys, C) -> (BS, Num_Keys)
+                lidar_norms = torch.norm(feature_map_lidar, p=2, dim=-1)  # (BS, Num_Keys)
+                lidar_mean = lidar_norms.mean().item()
+                lidar_std = lidar_norms.std(unbiased=False).item()  # Use unbiased=False for consistency
                 stats_text.append(f"Lidar: μ={lidar_mean:.3f}, σ={lidar_std:.3f}")
             if feature_map_view is not None:
-                view_mean = feature_map_view.mean().item()
-                view_std = feature_map_view.std().item()
+                view_norms = torch.norm(feature_map_view, p=2, dim=-1)  # (BS, Num_Keys)
+                view_mean = view_norms.mean().item()
+                view_std = view_norms.std(unbiased=False).item()
                 stats_text.append(f"View: μ={view_mean:.3f}, σ={view_std:.3f}")
             if fused_feature is not None:
-                fused_mean = fused_feature.mean().item()
-                fused_std = fused_feature.std().item()
+                fused_norms = torch.norm(fused_feature, p=2, dim=-1)  # (BS, Num_Keys)
+                fused_mean = fused_norms.mean().item()
+                fused_std = fused_norms.std(unbiased=False).item()
                 stats_text.append(f"Fused: μ={fused_mean:.3f}, σ={fused_std:.3f}")
             
             if len(stats_text) > 0 and plot_idx < len(axes):
@@ -599,240 +555,41 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         except Exception as e:
             print(f"Fusion diag vis error: {e}")
 
-    def visualize_adaptive_weights(self, lidar_weight, view_weight, reference_points, layer_idx, 
-                                   gt_bboxes_3d=None, spatial_shapes=None):
-        """
-        可视化每个query的自适应融合权重
-        
-        Args:
-            lidar_weight: (bs, num_query, 1) Lidar融合权重
-            view_weight: (bs, num_query, 1) View融合权重
-            reference_points: (bs, num_query, 2) Reference points
-            layer_idx: 当前层索引
-            gt_bboxes_3d: Ground truth boxes (可选)
-            spatial_shapes: Spatial shapes for BEV visualization (可选)
-        """
+    def visualize_feature_comparison(self, reference_points, layer_idx,
+                                     feature_map_lidar, feature_map_view, fused_feature,
+                                     spatial_shapes, gt_bboxes_3d):
+        """Visualize feature comparison: magnitude distribution, alignment, fusion effect"""
         if self.debug_step % 1000 != 0:
             return
         
         try:
-            # 提取权重
-            weights_lidar = lidar_weight[0, :, 0].detach().cpu().numpy()
-            weights_view = view_weight[0, :, 0].detach().cpu().numpy()
-            pts = reference_points[0].detach().cpu().numpy()
-            
-            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-            
-            # 1. 权重直方图
-            axes[0].hist(weights_lidar, bins=50, alpha=0.7, label='Lidar', color='green', edgecolor='black')
-            axes[0].hist(weights_view, bins=50, alpha=0.7, label='View', color='red', edgecolor='black')
-            axes[0].set_xlabel('Weight Value', fontsize=12)
-            axes[0].set_ylabel('Query Count', fontsize=12)
-            axes[0].set_title(f'Weight Distribution (Layer {layer_idx})', fontsize=14, fontweight='bold')
-            axes[0].legend(fontsize=11)
-            axes[0].grid(True, alpha=0.3)
-            
-            # 添加统计信息
-            lidar_mean = weights_lidar.mean()
-            view_mean = weights_view.mean()
-            axes[0].axvline(lidar_mean, color='green', linestyle='--', linewidth=2, label=f'Lidar mean={lidar_mean:.3f}')
-            axes[0].axvline(view_mean, color='red', linestyle='--', linewidth=2, label=f'View mean={view_mean:.3f}')
-            
-            # 2. 权重散点图 (Lidar vs View)
-            axes[1].scatter(weights_lidar, weights_view, alpha=0.5, s=10, c='blue', edgecolors='black', linewidths=0.1)
-            axes[1].plot([0, 1], [1, 0], 'r--', linewidth=2, label='sum=1', alpha=0.7)
-            axes[1].set_xlabel('Lidar Weight', fontsize=12)
-            axes[1].set_ylabel('View Weight', fontsize=12)
-            axes[1].set_title('Lidar vs View Weights (Per Query)', fontsize=14, fontweight='bold')
-            axes[1].legend(fontsize=11)
-            axes[1].grid(True, alpha=0.3)
-            axes[1].set_xlim(0, 1)
-            axes[1].set_ylim(0, 1)
-            
-            # 添加对角线标注
-            axes[1].text(0.5, 0.5, 'Equal weights', rotation=-45, ha='center', va='center',
-                        bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.3), fontsize=10)
-            
-            # 3. 权重空间分布（在BEV空间上可视化）
-            if spatial_shapes is not None:
-                H, W = spatial_shapes[0].tolist()
-                # 创建BEV权重图
-                lidar_weight_map = np.zeros((H, W))
-                view_weight_map = np.zeros((H, W))
-                
-                # 将reference points映射到BEV空间
-                for i, (x, y) in enumerate(pts):
-                    x_idx = int(x * W)
-                    y_idx = int(y * H)
-                    x_idx = np.clip(x_idx, 0, W - 1)
-                    y_idx = np.clip(y_idx, 0, H - 1)
-                    lidar_weight_map[y_idx, x_idx] = weights_lidar[i]
-                    view_weight_map[y_idx, x_idx] = weights_view[i]
-                
-                # 使用双通道显示：绿色=Lidar权重，红色=View权重
-                weight_blend = np.zeros((H, W, 3))
-                weight_blend[..., 0] = view_weight_map  # Red = View
-                weight_blend[..., 1] = lidar_weight_map  # Green = Lidar
-                # Blue = 0
-                
-                # Resize for visualization
-                img_h, img_w = 200, 200
-                weight_blend_resized = cv2.resize(weight_blend, (img_w, img_h))
-                weight_blend_resized = np.clip(weight_blend_resized, 0, 1)
-                
-                axes[2].imshow(weight_blend_resized, extent=[0, 1, 1, 0])
-                axes[2].scatter(pts[:, 0], pts[:, 1], c='cyan', s=3, alpha=0.6, edgecolors='white', linewidths=0.1)
-                axes[2].set_xlabel('X (Normalized)', fontsize=12)
-                axes[2].set_ylabel('Y (Normalized)', fontsize=12)
-                axes[2].set_title('Spatial Weight Distribution\n(R=View, G=Lidar)', fontsize=14, fontweight='bold')
-                axes[2].set_xlim(0, 1)
-                axes[2].set_ylim(1, 0)
+            # Compute feature norms
+            if feature_map_lidar is not None:
+                lidar_norms = torch.norm(feature_map_lidar, p=2, dim=-1).detach().cpu().numpy()  # (BS, Num_Keys)
+                lidar_norms_flat = lidar_norms.flatten()
             else:
-                # 如果没有spatial_shapes，显示权重排序
-                sorted_indices = np.argsort(weights_lidar)
-                axes[2].plot(weights_lidar[sorted_indices], label='Lidar', color='green', linewidth=2)
-                axes[2].plot(weights_view[sorted_indices], label='View', color='red', linewidth=2)
-                axes[2].set_xlabel('Query Index (Sorted by Lidar Weight)', fontsize=12)
-                axes[2].set_ylabel('Weight Value', fontsize=12)
-                axes[2].set_title('Weight Distribution (Sorted)', fontsize=14, fontweight='bold')
-                axes[2].legend(fontsize=11)
-                axes[2].grid(True, alpha=0.3)
-            
-            plt.suptitle(f'Adaptive Fusion Weights - Step {self.debug_step} Layer {layer_idx}', 
-                        fontsize=16, fontweight='bold', y=1.02)
-            plt.tight_layout()
-            
-            save_path = os.path.join(self.debug_dir, f"step_{self.debug_step}_layer_{layer_idx}_adaptive_weights.png")
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            plt.close()
-            
-        except Exception as e:
-            print(f"Adaptive weights vis error: {e}")
-
-    def visualize_cross_attention(self, attn_weights_lidar, attn_weights_view, reference_points, 
-                                  layer_idx, spatial_shapes=None, num_sample_queries=5):
-        """
-        可视化query对Lidar和View的attention分布
-        
-        Args:
-            attn_weights_lidar: (bs, num_query, num_keys) 或 (bs, num_heads, num_query, num_keys)
-            attn_weights_view: (bs, num_query, num_keys) 或 (bs, num_heads, num_query, num_keys)
-            reference_points: (bs, num_query, 2)
-            layer_idx: 当前层索引
-            spatial_shapes: Spatial shapes for BEV visualization
-            num_sample_queries: 选择多少个代表性的query进行可视化
-        """
-        if self.debug_step % 1000 != 0:
-            return
-        
-        try:
-            # 处理attention weights的维度
-            if attn_weights_lidar.dim() == 4:  # (bs, num_heads, num_query, num_keys)
-                # 平均所有head
-                attn_weights_lidar = attn_weights_lidar.mean(dim=1)  # (bs, num_query, num_keys)
-            if attn_weights_view.dim() == 4:
-                attn_weights_view = attn_weights_view.mean(dim=1)
-            
-            bs, num_query, num_keys = attn_weights_lidar.shape
-            pts = reference_points[0].detach().cpu().numpy()
-            
-            # 选择代表性的queries（选择attention熵最大的，即最"不确定"的）
-            attn_entropy_lidar = -(attn_weights_lidar[0] * torch.log(attn_weights_lidar[0] + 1e-9)).sum(dim=-1)
-            attn_entropy_view = -(attn_weights_view[0] * torch.log(attn_weights_view[0] + 1e-9)).sum(dim=-1)
-            combined_entropy = attn_entropy_lidar + attn_entropy_view
-            top_queries = torch.topk(combined_entropy, min(num_sample_queries, num_query)).indices.cpu().numpy()
-            
-            num_plots = len(top_queries)
-            fig, axes = plt.subplots(num_plots, 2, figsize=(12, 4 * num_plots))
-            if num_plots == 1:
-                axes = axes.reshape(1, -1)
-            
-            for plot_idx, q_idx in enumerate(top_queries):
-                # Lidar attention
-                attn_lidar = attn_weights_lidar[0, q_idx].detach().cpu().numpy()
-                # View attention
-                attn_view = attn_weights_view[0, q_idx].detach().cpu().numpy()
+                lidar_norms_flat = None
                 
-                # 可视化Lidar attention
-                if spatial_shapes is not None:
-                    H, W = spatial_shapes[0].tolist()
-                    # 将attention weights reshape到BEV空间
-                    if len(attn_lidar) >= H * W:
-                        attn_lidar_map = attn_lidar[:H*W].reshape(H, W)
-                        attn_view_map = attn_view[:H*W].reshape(H, W)
-                        
-                        # Resize for visualization
-                        img_h, img_w = 200, 200
-                        attn_lidar_resized = cv2.resize(attn_lidar_map, (img_w, img_h))
-                        attn_view_resized = cv2.resize(attn_view_map, (img_w, img_h))
-                        
-                        axes[plot_idx, 0].imshow(attn_lidar_resized, cmap='hot', extent=[0, 1, 1, 0])
-                        axes[plot_idx, 0].scatter(pts[q_idx, 0], pts[q_idx, 1], c='cyan', s=50, 
-                                                  marker='*', edgecolors='white', linewidths=1)
-                        axes[plot_idx, 0].set_title(f'Query {q_idx}: Lidar Attention', fontweight='bold')
-                        axes[plot_idx, 0].set_xlim(0, 1)
-                        axes[plot_idx, 0].set_ylim(1, 0)
-                        
-                        axes[plot_idx, 1].imshow(attn_view_resized, cmap='hot', extent=[0, 1, 1, 0])
-                        axes[plot_idx, 1].scatter(pts[q_idx, 0], pts[q_idx, 1], c='cyan', s=50,
-                                                  marker='*', edgecolors='white', linewidths=1)
-                        axes[plot_idx, 1].set_title(f'Query {q_idx}: View Attention', fontweight='bold')
-                        axes[plot_idx, 1].set_xlim(0, 1)
-                        axes[plot_idx, 1].set_ylim(1, 0)
-                    else:
-                        # 如果无法reshape，显示attention分布
-                        axes[plot_idx, 0].bar(range(len(attn_lidar)), attn_lidar, alpha=0.7, color='green')
-                        axes[plot_idx, 0].set_title(f'Query {q_idx}: Lidar Attention Distribution')
-                        axes[plot_idx, 1].bar(range(len(attn_view)), attn_view, alpha=0.7, color='red')
-                        axes[plot_idx, 1].set_title(f'Query {q_idx}: View Attention Distribution')
-                else:
-                    # 没有spatial_shapes，显示attention分布
-                    axes[plot_idx, 0].bar(range(len(attn_lidar)), attn_lidar, alpha=0.7, color='green')
-                    axes[plot_idx, 0].set_title(f'Query {q_idx}: Lidar Attention Distribution')
-                    axes[plot_idx, 1].bar(range(len(attn_view)), attn_view, alpha=0.7, color='red')
-                    axes[plot_idx, 1].set_title(f'Query {q_idx}: View Attention Distribution')
+            if feature_map_view is not None:
+                view_norms = torch.norm(feature_map_view, p=2, dim=-1).detach().cpu().numpy()
+                view_norms_flat = view_norms.flatten()
+            else:
+                view_norms_flat = None
+                
+            if fused_feature is not None:
+                fused_norms = torch.norm(fused_feature, p=2, dim=-1).detach().cpu().numpy()
+                fused_norms_flat = fused_norms.flatten()
+            else:
+                fused_norms_flat = None
             
-            plt.suptitle(f'Cross-Attention Visualization - Step {self.debug_step} Layer {layer_idx}',
-                        fontsize=16, fontweight='bold', y=0.995)
-            plt.tight_layout()
-            
-            save_path = os.path.join(self.debug_dir, f"step_{self.debug_step}_layer_{layer_idx}_cross_attention.png")
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            plt.close()
-            
-        except Exception as e:
-            print(f"Cross-attention vis error: {e}")
-
-    def visualize_feature_comparison(self, feat_lidar, feat_view, feat_fused, reference_points,
-                                     layer_idx, gt_bboxes_3d=None, spatial_shapes=None):
-        """
-        对比融合前后的特征质量
-        
-        Args:
-            feat_lidar: (bs, num_query, embed_dims) Lidar特征
-            feat_view: (bs, num_query, embed_dims) View特征
-            feat_fused: (bs, num_query, embed_dims) 融合后特征
-            reference_points: (bs, num_query, 2)
-            layer_idx: 当前层索引
-            gt_bboxes_3d: Ground truth (可选)
-            spatial_shapes: Spatial shapes (可选)
-        """
-        if self.debug_step % 1000 != 0:
-            return
-        
-        try:
-            # 计算特征统计信息
-            lidar_norm = torch.norm(feat_lidar[0], dim=-1).detach().cpu().numpy()
-            view_norm = torch.norm(feat_view[0], dim=-1).detach().cpu().numpy()
-            fused_norm = torch.norm(feat_fused[0], dim=-1).detach().cpu().numpy()
-            
-            # 计算特征与GT的相关性（如果有GT）
-            gt_correlation = None
-            if gt_bboxes_3d is not None:
+            # Compute GT distances if available
+            gt_distances = None
+            if gt_bboxes_3d is not None and reference_points is not None:
                 try:
+                    pts = reference_points[0].detach().cpu().numpy()  # (Num_Query, 2)
                     gt = gt_bboxes_3d[0]
+                    
                     if hasattr(gt, 'instance_list'):
-                        # 计算预测点与GT的距离
                         all_gt_pts = []
                         for line in gt.instance_list:
                             l_pts = np.array(line.coords)
@@ -842,175 +599,334 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                             all_gt_pts.append(l_pts)
                         if len(all_gt_pts) > 0:
                             gt_pts = np.concatenate(all_gt_pts, axis=0)
-                            pts = reference_points[0].detach().cpu().numpy()
-                            
-                            # 计算每个query到最近GT点的距离
-                            if cdist is not None:
+                            # Compute distance from each query point to nearest GT point
+                            try:
+                                from scipy.spatial.distance import cdist
                                 distances = cdist(pts, gt_pts)
-                                min_distances = distances.min(axis=1)
-                                gt_correlation = min_distances
-                            else:
-                                # 如果scipy不可用，使用简单的欧氏距离
-                                min_distances = []
-                                for pt in pts:
-                                    dists = np.sqrt(((gt_pts - pt) ** 2).sum(axis=1))
-                                    min_distances.append(dists.min())
-                                gt_correlation = np.array(min_distances)
+                                gt_distances = distances.min(axis=1)  # (Num_Query,)
+                            except ImportError:
+                                # Fallback: simple euclidean distance
+                                distances = np.sqrt(((pts[:, None, :] - gt_pts[None, :, :]) ** 2).sum(axis=-1))
+                                gt_distances = distances.min(axis=1)
+                except:
+                    try:
+                        # Fallback: simple euclidean distance
+                        if hasattr(gt, 'tensor'):
+                            gt_pts = gt.tensor[0, :, :2].cpu().numpy()
+                        else:
+                            gt_pts = gt[0, :, :2].cpu().numpy()
+                        distances = np.sqrt(((pts[:, None, :] - gt_pts[None, :, :]) ** 2).sum(axis=-1))
+                        gt_distances = distances.min(axis=1)
+                    except:
+                        pass
+            
+            fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+            
+            # Plot 1: Feature Magnitude Distribution
+            ax = axes[0, 0]
+            if lidar_norms_flat is not None:
+                ax.hist(lidar_norms_flat, bins=50, alpha=0.6, label='Lidar', color='green', density=True)
+            if view_norms_flat is not None:
+                ax.hist(view_norms_flat, bins=50, alpha=0.6, label='View', color='red', density=True)
+            if fused_norms_flat is not None:
+                ax.hist(fused_norms_flat, bins=50, alpha=0.6, label='Fused', color='blue', density=True)
+            ax.set_xlabel('Feature Magnitude (L2 Norm)')
+            ax.set_ylabel('Density')
+            ax.set_title('Feature Magnitude Distribution')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Plot 2: Lidar vs View Feature Magnitude
+            ax = axes[0, 1]
+            if lidar_norms_flat is not None and view_norms_flat is not None:
+                # Sample for visualization if too many points
+                if len(lidar_norms_flat) > 10000:
+                    indices = np.random.choice(len(lidar_norms_flat), 10000, replace=False)
+                    ax.scatter(lidar_norms_flat[indices], view_norms_flat[indices], 
+                             alpha=0.3, s=1, c='blue')
+                else:
+                    ax.scatter(lidar_norms_flat, view_norms_flat, alpha=0.3, s=1, c='blue')
+                # Add y=x line
+                max_val = max(lidar_norms_flat.max(), view_norms_flat.max())
+                ax.plot([0, max_val], [0, max_val], 'r--', linewidth=2, label='y=x')
+            ax.set_xlabel('Lidar Feature Magnitude')
+            ax.set_ylabel('View Feature Magnitude')
+            ax.set_title('Lidar vs View Feature Magnitude')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Plot 3: Fusion Effect: Input vs Output
+            ax = axes[0, 2]
+            if fused_norms_flat is not None:
+                if lidar_norms_flat is not None:
+                    if len(lidar_norms_flat) > 10000:
+                        indices = np.random.choice(len(lidar_norms_flat), 10000, replace=False)
+                        ax.scatter(lidar_norms_flat[indices], fused_norms_flat[indices], 
+                                 alpha=0.3, s=1, c='green', label='Lidar->Fused')
+                    else:
+                        ax.scatter(lidar_norms_flat, fused_norms_flat, 
+                                 alpha=0.3, s=1, c='green', label='Lidar->Fused')
+                if view_norms_flat is not None:
+                    if len(view_norms_flat) > 10000:
+                        indices = np.random.choice(len(view_norms_flat), 10000, replace=False)
+                        ax.scatter(view_norms_flat[indices], fused_norms_flat[indices], 
+                                 alpha=0.3, s=1, c='red', label='View->Fused')
+                    else:
+                        ax.scatter(view_norms_flat, fused_norms_flat, 
+                                 alpha=0.3, s=1, c='red', label='View->Fused')
+                max_val = fused_norms_flat.max()
+                ax.plot([0, max_val], [0, max_val], 'b--', linewidth=2, label='y=x')
+            ax.set_xlabel('Input Feature Magnitude')
+            ax.set_ylabel('Fused Feature Magnitude')
+            ax.set_title('Fusion Effect: Input vs Output')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Plot 4: Feature Quality vs GT Distance
+            ax = axes[1, 0]
+            if gt_distances is not None:
+                # Normalize distances
+                gt_distances_norm = gt_distances / (gt_distances.max() + 1e-9)
+                if lidar_norms_flat is not None and len(lidar_norms_flat) == len(gt_distances_norm):
+                    ax.scatter(gt_distances_norm, lidar_norms_flat, alpha=0.3, s=1, c='green', label='Lidar')
+                if view_norms_flat is not None and len(view_norms_flat) == len(gt_distances_norm):
+                    ax.scatter(gt_distances_norm, view_norms_flat, alpha=0.3, s=1, c='red', label='View')
+                if fused_norms_flat is not None and len(fused_norms_flat) == len(gt_distances_norm):
+                    ax.scatter(gt_distances_norm, fused_norms_flat, alpha=0.3, s=1, c='blue', label='Fused')
+            ax.set_xlabel('Normalized GT Distance')
+            ax.set_ylabel('Feature Magnitude')
+            ax.set_title('Feature Quality vs GT Distance')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Plot 5: Feature Statistics
+            ax = axes[1, 1]
+            stats_text = []
+            if lidar_norms_flat is not None:
+                lidar_mean = lidar_norms_flat.mean()
+                lidar_std = lidar_norms_flat.std()
+                stats_text.append(f"Lidar: μ={lidar_mean:.3f}, σ={lidar_std:.3f}")
+            if view_norms_flat is not None:
+                view_mean = view_norms_flat.mean()
+                view_std = view_norms_flat.std()
+                stats_text.append(f"View: μ={view_mean:.3f}, σ={view_std:.3f}")
+            if fused_norms_flat is not None:
+                fused_mean = fused_norms_flat.mean()
+                fused_std = fused_norms_flat.std()
+                stats_text.append(f"Fused: μ={fused_mean:.3f}, σ={fused_std:.3f}")
+                if lidar_norms_flat is not None and view_norms_flat is not None:
+                    fusion_gain = fused_mean / ((lidar_mean + view_mean) / 2 + 1e-9)
+                    stats_text.append(f"Fusion Gain: {fusion_gain:.3f}")
+            
+            ax.text(0.1, 0.5, '\n'.join(stats_text), transform=ax.transAxes,
+                   fontsize=12, verticalalignment='center',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            ax.axis('off')
+            ax.set_title("Feature Statistics")
+            
+            # Plot 6: Fused Feature Spatial Distribution
+            ax = axes[1, 2]
+            if fused_feature is not None and spatial_shapes is not None:
+                try:
+                    # Process fused feature for visualization
+                    if fused_feature.dim() == 3:
+                        if fused_feature.shape[1] != fused_feature.shape[0] and fused_feature.shape[0] > fused_feature.shape[1]:
+                            seq_dim = 0
+                        else:
+                            seq_dim = 1
+                    else:
+                        seq_dim = 1
+                    
+                    current_len = fused_feature.shape[seq_dim]
+                    H, W = spatial_shapes[0].tolist()
+                    feat_len = H * W
+                    
+                    if current_len >= feat_len:
+                        if seq_dim == 0:
+                            feat = fused_feature[:feat_len, 0, :].detach().cpu()
+                        else:
+                            feat = fused_feature[0, :feat_len, :].detach().cpu()
+                        
+                        feat_norm = torch.norm(feat, dim=1).numpy()
+                        feat_img = feat_norm.reshape(H, W)
+                        feat_img = cv2.resize(feat_img, (200, 200))
+                        feat_img = (feat_img - feat_img.min()) / (feat_img.max() - feat_img.min() + 1e-9)
+                        
+                        ax.imshow(feat_img, cmap='viridis', extent=[0, 1, 1, 0])
+                        ax.set_title("Fused Feature Spatial Distribution")
                 except Exception as e:
-                    print(f"GT correlation calculation error: {e}")
-            
-            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-            
-            # 第一行：特征幅度分布
-            axes[0, 0].hist(lidar_norm, bins=50, alpha=0.7, label='Lidar', color='green', edgecolor='black')
-            axes[0, 0].hist(view_norm, bins=50, alpha=0.7, label='View', color='red', edgecolor='black')
-            axes[0, 0].hist(fused_norm, bins=50, alpha=0.7, label='Fused', color='blue', edgecolor='black')
-            axes[0, 0].set_xlabel('Feature Norm', fontsize=12)
-            axes[0, 0].set_ylabel('Count', fontsize=12)
-            axes[0, 0].set_title('Feature Magnitude Distribution', fontsize=14, fontweight='bold')
-            axes[0, 0].legend(fontsize=11)
-            axes[0, 0].grid(True, alpha=0.3)
-            
-            # 第二行第一列：特征幅度对比（散点图）
-            axes[0, 1].scatter(lidar_norm, view_norm, alpha=0.5, s=10, c='purple', edgecolors='black', linewidths=0.1)
-            axes[0, 1].plot([0, lidar_norm.max()], [0, view_norm.max()], 'r--', linewidth=2, alpha=0.7, label='y=x')
-            axes[0, 1].set_xlabel('Lidar Feature Norm', fontsize=12)
-            axes[0, 1].set_ylabel('View Feature Norm', fontsize=12)
-            axes[0, 1].set_title('Lidar vs View Feature Magnitude', fontsize=14, fontweight='bold')
-            axes[0, 1].legend(fontsize=11)
-            axes[0, 1].grid(True, alpha=0.3)
-            
-            # 第一行第三列：融合前后对比
-            axes[0, 2].scatter(lidar_norm, fused_norm, alpha=0.5, s=10, c='green', label='Lidar→Fused', 
-                              edgecolors='black', linewidths=0.1)
-            axes[0, 2].scatter(view_norm, fused_norm, alpha=0.5, s=10, c='red', label='View→Fused',
-                              edgecolors='black', linewidths=0.1)
-            axes[0, 2].plot([0, max(lidar_norm.max(), view_norm.max())], 
-                           [0, max(lidar_norm.max(), view_norm.max())], 'b--', linewidth=2, alpha=0.7)
-            axes[0, 2].set_xlabel('Input Feature Norm', fontsize=12)
-            axes[0, 2].set_ylabel('Fused Feature Norm', fontsize=12)
-            axes[0, 2].set_title('Fusion Effect: Input vs Output', fontsize=14, fontweight='bold')
-            axes[0, 2].legend(fontsize=11)
-            axes[0, 2].grid(True, alpha=0.3)
-            
-            # 第二行：如果有GT，显示特征与GT的相关性
-            if gt_correlation is not None:
-                axes[1, 0].scatter(gt_correlation, lidar_norm, alpha=0.5, s=10, c='green', 
-                                  label='Lidar', edgecolors='black', linewidths=0.1)
-                axes[1, 0].scatter(gt_correlation, view_norm, alpha=0.5, s=10, c='red',
-                                  label='View', edgecolors='black', linewidths=0.1)
-                axes[1, 0].scatter(gt_correlation, fused_norm, alpha=0.5, s=10, c='blue',
-                                  label='Fused', edgecolors='black', linewidths=0.1)
-                axes[1, 0].set_xlabel('Distance to GT (Normalized)', fontsize=12)
-                axes[1, 0].set_ylabel('Feature Norm', fontsize=12)
-                axes[1, 0].set_title('Feature Quality vs GT Distance', fontsize=14, fontweight='bold')
-                axes[1, 0].legend(fontsize=11)
-                axes[1, 0].grid(True, alpha=0.3)
+                    ax.text(0.5, 0.5, f"Error: {e}", ha='center')
             else:
-                axes[1, 0].text(0.5, 0.5, 'No GT available', ha='center', va='center', 
-                               transform=axes[1, 0].transAxes, fontsize=14)
-                axes[1, 0].set_title('Feature Quality vs GT Distance', fontsize=14, fontweight='bold')
+                ax.text(0.5, 0.5, "No Fused Feature", ha='center')
+            ax.axis('off')
             
-            # 统计信息文本
-            stats_text = [
-                f"Lidar: μ={lidar_norm.mean():.3f}, σ={lidar_norm.std():.3f}",
-                f"View: μ={view_norm.mean():.3f}, σ={view_norm.std():.3f}",
-                f"Fused: μ={fused_norm.mean():.3f}, σ={fused_norm.std():.3f}",
-                f"Fusion Gain: {(fused_norm.mean() / (lidar_norm.mean() + view_norm.mean()) * 2):.3f}"
-            ]
-            axes[1, 1].text(0.1, 0.5, '\n'.join(stats_text), transform=axes[1, 1].transAxes,
-                          fontsize=12, verticalalignment='center',
-                          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            axes[1, 1].axis('off')
-            axes[1, 1].set_title('Feature Statistics', fontsize=14, fontweight='bold')
-            
-            # 特征空间分布（如果有spatial_shapes）
-            if spatial_shapes is not None:
-                H, W = spatial_shapes[0].tolist()
-                pts = reference_points[0].detach().cpu().numpy()
-                
-                # 创建BEV特征图
-                def create_feat_map(feat_norm, pts, H, W):
-                    feat_map = np.zeros((H, W))
-                    for i, (x, y) in enumerate(pts):
-                        x_idx = int(x * W)
-                        y_idx = int(y * H)
-                        x_idx = np.clip(x_idx, 0, W - 1)
-                        y_idx = np.clip(y_idx, 0, H - 1)
-                        feat_map[y_idx, x_idx] = feat_norm[i]
-                    return feat_map
-                
-                lidar_map = create_feat_map(lidar_norm, pts, H, W)
-                view_map = create_feat_map(view_norm, pts, H, W)
-                fused_map = create_feat_map(fused_norm, pts, H, W)
-                
-                # Resize
-                img_h, img_w = 200, 200
-                lidar_resized = cv2.resize(lidar_map, (img_w, img_h))
-                view_resized = cv2.resize(view_map, (img_w, img_h))
-                fused_resized = cv2.resize(fused_map, (img_w, img_h))
-                
-                # 归一化
-                lidar_resized = (lidar_resized - lidar_resized.min()) / (lidar_resized.max() - lidar_resized.min() + 1e-9)
-                view_resized = (view_resized - view_resized.min()) / (view_resized.max() - view_resized.min() + 1e-9)
-                fused_resized = (fused_resized - fused_resized.min()) / (fused_resized.max() - fused_resized.min() + 1e-9)
-                
-                # 显示融合后的特征图
-                axes[1, 2].imshow(fused_resized, cmap='viridis', extent=[0, 1, 1, 0])
-                axes[1, 2].scatter(pts[:, 0], pts[:, 1], c='red', s=3, alpha=0.6, edgecolors='white', linewidths=0.1)
-                axes[1, 2].set_xlabel('X (Normalized)', fontsize=12)
-                axes[1, 2].set_ylabel('Y (Normalized)', fontsize=12)
-                axes[1, 2].set_title('Fused Feature Spatial Distribution', fontsize=14, fontweight='bold')
-                axes[1, 2].set_xlim(0, 1)
-                axes[1, 2].set_ylim(1, 0)
-            else:
-                axes[1, 2].axis('off')
-            
-            plt.suptitle(f'Feature Comparison - Step {self.debug_step} Layer {layer_idx}',
-                        fontsize=16, fontweight='bold', y=0.995)
+            plt.suptitle(f"Feature Comparison - Step {self.debug_step} Layer {layer_idx}")
             plt.tight_layout()
             
             save_path = os.path.join(self.debug_dir, f"step_{self.debug_step}_layer_{layer_idx}_feature_comparison.png")
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.savefig(save_path)
             plt.close()
             
         except Exception as e:
             print(f"Feature comparison vis error: {e}")
 
-    def visualize_layer_progression(self, all_layer_outputs, all_reference_points, all_weights, gt_bboxes_3d=None):
-        """
-        追踪6层decoder中融合效果的变化
-        
-        Args:
-            all_layer_outputs: List of (bs, num_query, embed_dims) 每层的输出
-            all_reference_points: List of (bs, num_query, 2) 每层的reference points
-            all_weights: List of (lidar_weight, view_weight) tuples 每层的融合权重
-            gt_bboxes_3d: Ground truth (可选)
-        """
+    def visualize_adaptive_weights(self, reference_points, layer_idx, adaptive_weights, spatial_shapes):
+        """Visualize adaptive weights distribution"""
         if self.debug_step % 1000 != 0:
             return
         
         try:
-            num_layers = len(all_layer_outputs)
-            if num_layers == 0:
+            # adaptive_weights: (BS, Num_Query, 2) -> [lidar_weight, view_weight]
+            if adaptive_weights.dim() == 3:
+                weights = adaptive_weights[0].detach().cpu().numpy()  # (Num_Query, 2)
+            else:
+                weights = adaptive_weights.detach().cpu().numpy()
+            
+            lidar_weights = weights[:, 0]
+            view_weights = weights[:, 1]
+            
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            
+            # Plot 1: Weight distribution histogram
+            ax = axes[0]
+            ax.hist(lidar_weights, bins=50, alpha=0.6, label='Lidar Weight', color='green', density=True)
+            ax.hist(view_weights, bins=50, alpha=0.6, label='View Weight', color='red', density=True)
+            ax.set_xlabel('Weight Value')
+            ax.set_ylabel('Density')
+            ax.set_title('Adaptive Weights Distribution')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Plot 2: Lidar vs View weights scatter
+            ax = axes[1]
+            ax.scatter(lidar_weights, view_weights, alpha=0.3, s=1, c='blue')
+            ax.plot([0, 1], [1, 0], 'r--', linewidth=2, label='lidar + view = 1')
+            ax.set_xlabel('Lidar Weight')
+            ax.set_ylabel('View Weight')
+            ax.set_title('Lidar vs View Weights')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            
+            # Plot 3: Spatial distribution of weights
+            ax = axes[2]
+            if spatial_shapes is not None and reference_points is not None:
+                pts = reference_points[0].detach().cpu().numpy()  # (Num_Query, 2)
+                # Color by lidar weight
+                scatter = ax.scatter(pts[:, 0], pts[:, 1], c=lidar_weights, 
+                                   cmap='RdYlGn', s=10, alpha=0.6, vmin=0, vmax=1)
+                plt.colorbar(scatter, ax=ax, label='Lidar Weight')
+                ax.set_xlim(0, 1)
+                ax.set_ylim(1, 0)
+                ax.set_title('Spatial Distribution of Lidar Weights')
+            else:
+                ax.text(0.5, 0.5, "No spatial info", ha='center')
+            ax.axis('off')
+            
+            plt.suptitle(f"Adaptive Weights - Step {self.debug_step} Layer {layer_idx}")
+            plt.tight_layout()
+            
+            save_path = os.path.join(self.debug_dir, f"step_{self.debug_step}_layer_{layer_idx}_adaptive_weights.png")
+            plt.savefig(save_path)
+            plt.close()
+            
+        except Exception as e:
+            print(f"Adaptive weights vis error: {e}")
+
+    def visualize_cross_attention(self, reference_points, layer_idx, 
+                                  query, value_lidar, value_view, spatial_shapes):
+        """Visualize cross-attention patterns between query and Lidar/View features"""
+        if self.debug_step % 1000 != 0:
+            return
+        
+        try:
+            # Compute attention approximation
+            def compute_attention_approx(q, v):
+                """Compute approximate attention weights"""
+                if q.dim() == 3:
+                    if q.shape[0] > q.shape[1] * 10 and q.shape[1] < 10:
+                        q = q.permute(1, 0, 2)
+                if v.dim() == 3:
+                    if v.shape[0] > v.shape[1] * 10 and v.shape[1] < 10:
+                        v = v.permute(1, 0, 2)
+                
+                if q.shape[0] != v.shape[0]:
+                    min_bs = min(q.shape[0], v.shape[0])
+                    q = q[:min_bs]
+                    v = v[:min_bs]
+                
+                q_norm = F.normalize(q, p=2, dim=-1)
+                v_norm = F.normalize(v, p=2, dim=-1)
+                attn = torch.bmm(q_norm, v_norm.transpose(1, 2))
+                attn = F.softmax(attn, dim=-1)
+                return attn
+            
+            if query is not None and value_lidar is not None:
+                attn_lidar = compute_attention_approx(query, value_lidar)
+                attn_lidar_mean = attn_lidar.mean(dim=0).detach().cpu().numpy()  # (Num_Query, Num_Keys)
+            else:
+                attn_lidar_mean = None
+                
+            if query is not None and value_view is not None:
+                attn_view = compute_attention_approx(query, value_view)
+                attn_view_mean = attn_view.mean(dim=0).detach().cpu().numpy()
+            else:
+                attn_view_mean = None
+            
+            fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+            
+            # Plot 1: Lidar attention
+            ax = axes[0]
+            if attn_lidar_mean is not None:
+                im = ax.imshow(attn_lidar_mean, cmap='hot', aspect='auto')
+                plt.colorbar(im, ax=ax, label='Attention Weight')
+                ax.set_xlabel('Lidar Feature Keys')
+                ax.set_ylabel('Query')
+                ax.set_title('Query-to-Lidar Attention')
+            else:
+                ax.text(0.5, 0.5, "No Lidar Attention", ha='center')
+            
+            # Plot 2: View attention
+            ax = axes[1]
+            if attn_view_mean is not None:
+                im = ax.imshow(attn_view_mean, cmap='hot', aspect='auto')
+                plt.colorbar(im, ax=ax, label='Attention Weight')
+                ax.set_xlabel('View Feature Keys')
+                ax.set_ylabel('Query')
+                ax.set_title('Query-to-View Attention')
+            else:
+                ax.text(0.5, 0.5, "No View Attention", ha='center')
+            
+            plt.suptitle(f"Cross-Attention - Step {self.debug_step} Layer {layer_idx}")
+            plt.tight_layout()
+            
+            save_path = os.path.join(self.debug_dir, f"step_{self.debug_step}_layer_{layer_idx}_cross_attention.png")
+            plt.savefig(save_path)
+            plt.close()
+            
+        except Exception as e:
+            print(f"Cross-attention vis error: {e}")
+
+    def visualize_layer_progression(self, intermediate_refs, gt_bboxes_3d):
+        """Visualize how predictions progress through layers"""
+        if self.debug_step % 1000 != 0:
+            return
+        
+        try:
+            if intermediate_refs is None or len(intermediate_refs) == 0:
                 return
             
-            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+            num_layers = len(intermediate_refs)
+            fig, axes = plt.subplots(2, 3, figsize=(18, 12))
             axes = axes.flatten()
             
-            # 计算每层的特征统计和与GT的距离
-            layer_stats = []
+            # Compute GT distances for each layer
+            gt_distances = []
             for lid in range(num_layers):
-                output = all_layer_outputs[lid]
-                ref_pts = all_reference_points[lid]
+                refs = intermediate_refs[lid]  # (BS, Num_Query, 2)
+                pts = refs[0].detach().cpu().numpy()
                 
-                # 特征统计
-                feat_norm = torch.norm(output[0], dim=-1).detach().cpu().numpy()
-                mean_norm = feat_norm.mean()
-                std_norm = feat_norm.std()
-                
-                # 计算与GT的距离（如果有GT）
-                gt_distance = None
                 if gt_bboxes_3d is not None:
                     try:
                         gt = gt_bboxes_3d[0]
@@ -1024,141 +940,72 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                                 all_gt_pts.append(l_pts)
                             if len(all_gt_pts) > 0:
                                 gt_pts = np.concatenate(all_gt_pts, axis=0)
-                                pts = ref_pts[0].detach().cpu().numpy()
-                                if cdist is not None:
+                                try:
+                                    from scipy.spatial.distance import cdist
                                     distances = cdist(pts, gt_pts)
-                                    gt_distance = distances.min(axis=1).mean()
-                                else:
-                                    # 如果scipy不可用，使用简单的欧氏距离
-                                    min_distances = []
-                                    for pt in pts:
-                                        dists = np.sqrt(((gt_pts - pt) ** 2).sum(axis=1))
-                                        min_distances.append(dists.min())
-                                    gt_distance = np.array(min_distances).mean()
-                    except Exception:
-                        pass
-                
-                # 融合权重统计
-                if lid < len(all_weights) and all_weights[lid] is not None:
-                    lidar_w, view_w = all_weights[lid]
-                    if isinstance(lidar_w, torch.Tensor):
-                        lidar_w_mean = lidar_w[0, :, 0].mean().item() if lidar_w.dim() == 3 else lidar_w.mean().item()
-                        view_w_mean = view_w[0, :, 0].mean().item() if view_w.dim() == 3 else view_w.mean().item()
-                    else:
-                        lidar_w_mean = lidar_w
-                        view_w_mean = view_w
+                                    mean_dist = distances.min(axis=1).mean()
+                                except ImportError:
+                                    # Fallback: simple euclidean distance
+                                    distances = np.sqrt(((pts[:, None, :] - gt_pts[None, :, :]) ** 2).sum(axis=-1))
+                                    mean_dist = distances.min(axis=1).mean()
+                                except Exception:
+                                    mean_dist = None
+                            else:
+                                mean_dist = None
+                        else:
+                            mean_dist = None
+                    except:
+                        mean_dist = None
                 else:
-                    lidar_w_mean = 0.5
-                    view_w_mean = 0.5
+                    mean_dist = None
                 
-                layer_stats.append({
-                    'layer': lid,
-                    'mean_norm': mean_norm,
-                    'std_norm': std_norm,
-                    'gt_distance': gt_distance,
-                    'lidar_weight': lidar_w_mean,
-                    'view_weight': view_w_mean
-                })
+                gt_distances.append(mean_dist)
+                
+                # Plot predictions for this layer
+                if lid < len(axes):
+                    ax = axes[lid]
+                    ax.scatter(pts[:, 0], pts[:, 1], c='red', s=5, alpha=0.6, label='Pred')
+                    
+                    if gt_bboxes_3d is not None:
+                        try:
+                            gt = gt_bboxes_3d[0]
+                            if hasattr(gt, 'instance_list'):
+                                for line in gt.instance_list:
+                                    l_pts = np.array(line.coords)
+                                    if hasattr(gt, 'max_x') and hasattr(gt, 'max_y'):
+                                        l_pts[:, 0] /= gt.max_x
+                                        l_pts[:, 1] /= gt.max_y
+                                    ax.plot(l_pts[:, 0], l_pts[:, 1], 'g-', linewidth=1, alpha=0.6)
+                        except:
+                            pass
+                    
+                    ax.set_xlim(0, 1)
+                    ax.set_ylim(1, 0)
+                    title = f"Layer {lid}"
+                    if mean_dist is not None:
+                        title += f" (GT Dist: {mean_dist:.4f})"
+                    ax.set_title(title)
+                    ax.axis('off')
             
-            # 1. 特征幅度随层数变化
-            layers = [s['layer'] for s in layer_stats]
-            mean_norms = [s['mean_norm'] for s in layer_stats]
-            std_norms = [s['std_norm'] for s in layer_stats]
+            # Summary plot: GT distance vs layer
+            if len(axes) > num_layers:
+                ax = axes[num_layers]
+                if any(d is not None for d in gt_distances):
+                    valid_dists = [(i, d) for i, d in enumerate(gt_distances) if d is not None]
+                    if len(valid_dists) > 0:
+                        layers, dists = zip(*valid_dists)
+                        ax.plot(layers, dists, 'b-o', linewidth=2, markersize=8)
+                        ax.set_xlabel('Layer')
+                        ax.set_ylabel('Mean GT Distance')
+                        ax.set_title('Prediction Accuracy vs Layer')
+                        ax.grid(True, alpha=0.3)
+                        ax.set_xticks(range(num_layers))
             
-            axes[0].plot(layers, mean_norms, 'o-', linewidth=2, markersize=8, label='Mean Norm', color='blue')
-            axes[0].fill_between(layers, 
-                                [m - s for m, s in zip(mean_norms, std_norms)],
-                                [m + s for m, s in zip(mean_norms, std_norms)],
-                                alpha=0.3, color='blue', label='±1 std')
-            axes[0].set_xlabel('Layer Index', fontsize=12)
-            axes[0].set_ylabel('Feature Norm', fontsize=12)
-            axes[0].set_title('Feature Magnitude Progression', fontsize=14, fontweight='bold')
-            axes[0].legend(fontsize=11)
-            axes[0].grid(True, alpha=0.3)
-            axes[0].set_xticks(layers)
-            
-            # 2. 融合权重随层数变化
-            lidar_weights = [s['lidar_weight'] for s in layer_stats]
-            view_weights = [s['view_weight'] for s in layer_stats]
-            
-            axes[1].plot(layers, lidar_weights, 'o-', linewidth=2, markersize=8, label='Lidar Weight', color='green')
-            axes[1].plot(layers, view_weights, 's-', linewidth=2, markersize=8, label='View Weight', color='red')
-            axes[1].set_xlabel('Layer Index', fontsize=12)
-            axes[1].set_ylabel('Fusion Weight', fontsize=12)
-            axes[1].set_title('Fusion Weight Progression', fontsize=14, fontweight='bold')
-            axes[1].legend(fontsize=11)
-            axes[1].grid(True, alpha=0.3)
-            axes[1].set_ylim(0, 1)
-            axes[1].set_xticks(layers)
-            
-            # 3. 与GT的距离随层数变化（如果有GT）
-            if any(s['gt_distance'] is not None for s in layer_stats):
-                gt_distances = [s['gt_distance'] if s['gt_distance'] is not None else 0 for s in layer_stats]
-                axes[2].plot(layers, gt_distances, 'o-', linewidth=2, markersize=8, label='Mean Distance to GT', color='purple')
-                axes[2].set_xlabel('Layer Index', fontsize=12)
-                axes[2].set_ylabel('Distance to GT (Normalized)', fontsize=12)
-                axes[2].set_title('Prediction Accuracy Progression', fontsize=14, fontweight='bold')
-                axes[2].legend(fontsize=11)
-                axes[2].grid(True, alpha=0.3)
-                axes[2].set_xticks(layers)
-            else:
-                axes[2].text(0.5, 0.5, 'No GT available', ha='center', va='center',
-                           transform=axes[2].transAxes, fontsize=14)
-                axes[2].set_title('Prediction Accuracy Progression', fontsize=14, fontweight='bold')
-            
-            # 4. 权重变化趋势（Lidar vs View）
-            axes[3].scatter(lidar_weights, view_weights, s=100, c=layers, cmap='viridis', 
-                           edgecolors='black', linewidths=2, alpha=0.7)
-            axes[3].plot([0, 1], [1, 0], 'r--', linewidth=2, alpha=0.5, label='sum=1')
-            for i, lid in enumerate(layers):
-                axes[3].annotate(f'L{lid}', (lidar_weights[i], view_weights[i]), 
-                               fontsize=10, ha='center', va='center', color='white', fontweight='bold')
-            axes[3].set_xlabel('Lidar Weight', fontsize=12)
-            axes[3].set_ylabel('View Weight', fontsize=12)
-            axes[3].set_title('Weight Evolution Across Layers', fontsize=14, fontweight='bold')
-            axes[3].legend(fontsize=11)
-            axes[3].grid(True, alpha=0.3)
-            axes[3].set_xlim(0, 1)
-            axes[3].set_ylim(0, 1)
-            
-            # 5. 特征质量指标（综合）
-            # 计算"质量分数"：特征幅度 / (1 + GT距离)
-            quality_scores = []
-            for s in layer_stats:
-                if s['gt_distance'] is not None:
-                    quality = s['mean_norm'] / (1 + s['gt_distance'])
-                else:
-                    quality = s['mean_norm']
-                quality_scores.append(quality)
-            
-            axes[4].plot(layers, quality_scores, 'o-', linewidth=2, markersize=8, label='Quality Score', color='orange')
-            axes[4].set_xlabel('Layer Index', fontsize=12)
-            axes[4].set_ylabel('Quality Score', fontsize=12)
-            axes[4].set_title('Overall Feature Quality Progression', fontsize=14, fontweight='bold')
-            axes[4].legend(fontsize=11)
-            axes[4].grid(True, alpha=0.3)
-            axes[4].set_xticks(layers)
-            
-            # 6. 统计信息表格
-            stats_text = ["Layer Progression Summary:\n"]
-            for s in layer_stats:
-                stats_text.append(f"L{s['layer']}: Norm={s['mean_norm']:.3f}, "
-                                f"Lidar={s['lidar_weight']:.2f}, View={s['view_weight']:.2f}")
-                if s['gt_distance'] is not None:
-                    stats_text[-1] += f", GT_dist={s['gt_distance']:.3f}"
-            
-            axes[5].text(0.1, 0.5, '\n'.join(stats_text), transform=axes[5].transAxes,
-                        fontsize=10, verticalalignment='center', family='monospace',
-                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            axes[5].axis('off')
-            axes[5].set_title('Layer Statistics', fontsize=14, fontweight='bold')
-            
-            plt.suptitle(f'Layer Progression Analysis - Step {self.debug_step}',
-                        fontsize=16, fontweight='bold', y=0.995)
+            plt.suptitle(f"Layer Progression - Step {self.debug_step}")
             plt.tight_layout()
             
             save_path = os.path.join(self.debug_dir, f"step_{self.debug_step}_layer_progression.png")
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.savefig(save_path)
             plt.close()
             
         except Exception as e:
@@ -1177,25 +1024,15 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
         intermediate = []
         intermediate_reference_points = []
         
-        # [NEW] 用于逐层追踪的数据收集
-        all_layer_outputs_for_vis = []
-        all_reference_points_for_vis = []
-        all_weights_for_vis = []
+        # [VIS] Save query for visualization
+        self._last_query = query
         
         # Capture the primary value (usually lidar) from kwargs
         value_lidar = kwargs.get('value', None)
         
-        # [PRIORITY 2] Initialize loss accumulators for this forward pass
-        if self.training:
-            self._gate_losses = []
-            # [REMOVED] 删除对齐损失：对比损失不work，只保留Cross-Attention对齐模块
-            # self._alignment_losses = []
-        
         for lid, layer in enumerate(self.layers):
             # [FIX] Ensure output is in correct shape (num_query, bs, embed_dims) at start of each iteration
             # output should be (num_query, bs, embed_dims) for layer input
-            # [PRIORITY 2] Pass layer index to kwargs for layer-specific gating
-            kwargs['layer_idx'] = lid
             if lid > 0:  # After first layer, output might have been permuted
                 # Check if output needs to be converted back to (num_query, bs, embed_dims)
                 if output.dim() == 3:
@@ -1205,174 +1042,45 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
             
             current_value = value_lidar
 
-            refined_view = None  # 初始化 refined_view
+            refined_view = None # 初始化 refined_view
             gate_values = None
-            fused_feature_for_vis = None  # 用于可视化的 BEV 融合特征
             if value_view is not None:
-                # [PRIORITY 1] Step 1: Spatial Alignment - Align View features to Lidar before fusion
-                aligned_view = value_view
-                alignment_loss = None
-                if self.use_spatial_alignment and value_lidar is not None:
-                    # [NEW] Cross-Attention对齐：LiDAR作为query，View作为key/value
-                    # value_lidar: (BS, Num_Keys, C)
-                    # value_view: (BS, Num_Keys, C)
-                    # 让LiDAR特征去"查询"View特征中对应的空间位置，学习空间对应关系
-                    
-                    # Cross-attention: query=LiDAR, key=value=View
-                    # [FIX] 添加位置编码（如果有）来帮助学习空间对应关系
-                    # 注意：这里假设value_lidar和value_view已经有位置信息（通过encoder）
-                    attn_output, attn_weights = self.spatial_alignment_attn(
-                        query=value_lidar,      # LiDAR特征作为query
-                        key=value_view,         # View特征作为key
-                        value=value_view,       # View特征作为value
-                        need_weights=False
-                    )
-                    
-                    # [FIX] 进一步弱化残差连接，让对齐效果更明显
-                    # 问题：如果残差太强，模型可能直接使用原始View特征，而不学习对齐
-                    # 解决：进一步降低残差权重（从0.8/0.2改为0.7/0.3，或者完全移除残差）
-                    aligned_view = self.alignment_norm(attn_output)
-                    # [FIX] 恢复残差连接，保留View特征的空间结构
-                    # 问题：完全移除残差连接会导致View特征变uniform（空间结构丢失）
-                    # 解决：使用50/50 blend，平衡对齐学习和空间结构保留
-                    aligned_view = 0.5 * aligned_view + 0.5 * value_view  # 50/50 blend
-                    
-                    # FFN增强：进一步处理对齐后的特征
-                    ffn_output = self.alignment_ffn(aligned_view)
-                    aligned_view = self.alignment_ffn_norm(ffn_output + aligned_view)
-                    
-                    # [PRIORITY 1 FIX] Magnitude对齐：scale到与Lidar相同的magnitude范围
-                    # 问题：Lidar和View的magnitude分布差异很大，导致融合不稳定
-                    # 解决：在对齐后normalize magnitude，确保两个模态的特征在相同的magnitude范围内
-                    # [FIX] 检查View特征是否被过度normalize：如果magnitude已经对齐（scale≈1.0），跳过对齐
-                    with torch.no_grad():
-                        # 计算Lidar和View的平均magnitude
-                        lidar_magnitude = value_lidar.norm(dim=-1, keepdim=True).mean()  # (1,)
-                        aligned_view_magnitude = aligned_view.norm(dim=-1, keepdim=True).mean()  # (1,)
-                        # 计算magnitude scale factor
-                        magnitude_scale = lidar_magnitude / (aligned_view_magnitude + 1e-8)
-                        # [DEBUG] 监控magnitude对齐效果
-                        if self.training and self.debug_step % 1000 == 0:
-                            print(f"[MAGNITUDE ALIGN] Step {self.debug_step}, Layer {lid}: "
-                                  f"lidar_mag={lidar_magnitude.item():.4f}, "
-                                  f"view_mag={aligned_view_magnitude.item():.4f}, "
-                                  f"scale={magnitude_scale.item():.4f}")
-                        # [PRIORITY 1 FIX] 如果View特征magnitude已经很小（可能被过度normalize），增强View特征
-                        # 如果View特征magnitude < Lidar特征magnitude的50%，说明View特征可能被过度抑制
-                        if aligned_view_magnitude < lidar_magnitude * 0.5:
-                            # 增强View特征：将magnitude scale限制在合理范围内，避免过度放大
-                            magnitude_scale = torch.clamp(magnitude_scale, min=0.5, max=2.0)
-                            if self.training and self.debug_step % 1000 == 0:
-                                print(f"[VIEW ENHANCE] Step {self.debug_step}, Layer {lid}: "
-                                      f"View magnitude too low, applying enhanced scale={magnitude_scale.item():.4f}")
-                    # 应用magnitude scale
-                    aligned_view = aligned_view * magnitude_scale
-                    
-                    # [REMOVED] 删除对比对齐损失：损失不work（pos_sim == neg_sim），只保留Cross-Attention对齐模块
-                    # Cross-Attention对齐模块仍然会学习空间对应关系，通过主检测损失的反向传播
-                    # 如果需要在训练时监控对齐效果，可以添加调试信息（但不计算损失）
-                    if self.training and self.debug_step % 1000 == 0:
-                        # [DEBUG] 可选：打印对齐效果（不计算损失）
-                        with torch.no_grad():
-                            # 计算对齐后的相似度（用于监控，不用于损失）
-                            alignment_sim = F.cosine_similarity(value_lidar, aligned_view, dim=-1).mean()
-                            # [FIX] 修复方差计算：计算每个特征向量在通道维度上的方差（空间方差）
-                            # 特征形状：(BS, Num_Keys, C)
-                            # var(dim=-1) -> (BS, Num_Keys) 每个位置的特征向量在通道维度上的方差
-                            # mean() -> scalar 所有位置的平均方差
-                            view_spatial_var = aligned_view.var(dim=-1, unbiased=False).mean()
-                            lidar_spatial_var = value_lidar.var(dim=-1, unbiased=False).mean()
-                            
-                            # 处理NaN
-                            if torch.isnan(view_spatial_var):
-                                view_spatial_var = torch.tensor(0.0, device=aligned_view.device)
-                            if torch.isnan(lidar_spatial_var):
-                                lidar_spatial_var = torch.tensor(0.0, device=value_lidar.device)
-                            
-                            print(f"[ALIGNMENT DEBUG] Step {self.debug_step}, Layer {lid}: "
-                                  f"alignment_sim={alignment_sim.item():.4f}, "
-                                  f"view_var={view_spatial_var.item():.4f}, lidar_var={lidar_spatial_var.item():.4f}")
-                
-                # 1. Gating / Noise Filtering (now operates on aligned features)
-                refined_view = aligned_view
+                # 1. Gating / Noise Filtering
+                refined_view = value_view
                 if self.use_gating and value_lidar is not None:
                      # ... existing gating logig ...
                     # value_lidar: (BS, Num_Keys, C)
-                    # aligned_view: (BS, Num_Keys, C) - now using aligned View features
+                    # value_view: (BS, Num_Keys, C)
                     # Concat along channel dimension
-                    cat_feat = torch.cat([value_lidar, aligned_view], dim=-1)
-                    # [PRIORITY 2] Use layer-specific gating module
-                    layer_idx = kwargs.get('layer_idx', 0)  # Get current layer index
-                    if hasattr(self, 'gating_modules') and layer_idx < len(self.gating_modules):
-                        gate_logits = self.gating_modules[layer_idx](cat_feat)  # [FIX] Layer-specific gating
-                    else:
-                        # Fallback to single gating module if layer-specific not available
-                        gate_logits = self.gating_module(cat_feat) if hasattr(self, 'gating_module') else cat_feat.mean(dim=-1, keepdim=True)
+                    cat_feat = torch.cat([value_lidar, value_view], dim=-1)
+                    gate = self.gating_module(cat_feat)
                     
-                    # [PRIORITY 2 FIX] Apply temperature-scaled sigmoid (only once, not double sigmoid)
-                    # [FIX] Removed double sigmoid: gating_module no longer has Sigmoid, so we apply it here with temperature
+                    # [IMPROVED] Apply temperature scaling to control gate value distribution
                     if self.gate_temperature != 1.0:
                         # Temperature scaling: lower temperature = more conservative (lower gate values)
-                        gate = torch.sigmoid(gate_logits / self.gate_temperature)
-                    else:
-                        gate = torch.sigmoid(gate_logits)
+                        # Formula: sigmoid((x - 0.5) / T + 0.5) where T is temperature
+                        gate = torch.sigmoid((gate - 0.5) / self.gate_temperature + 0.5)
                     
-                    # [PRIORITY 2] Add gate regularization loss (encourage lower gate values and spatial selectivity)
-                    gate_sparsity_loss = gate.mean()  # Encourage lower gate values
-                    gate_variance_loss = -gate.var()  # Encourage spatial selectivity (higher variance)
-                    
-                    # [NEW] 更激进的Gating策略：当View特征缺乏空间区分度时，降低gate值
-                    # 检测View特征的空间方差（如果方差小，说明特征uniform，应该降低gate）
-                    if self.use_adaptive_gating:
-                        with torch.no_grad():
-                            # 计算每个样本的空间方差（在空间维度H*W上计算方差）
-                            view_spatial_var = aligned_view.var(dim=1).mean()  # [FIX] Use aligned_view instead of value_view
-                            # 如果方差小（<0.1），说明特征uniform（"一片黄色"），应该更保守地使用View
-                            if view_spatial_var < 0.1:
-                                # 降低gate值，更激进地过滤View特征
-                                gate = gate * 0.5  # 将gate值减半
-                                # [DEBUG] 只在训练时打印，避免日志过多
-                                if self.training and self.debug_step % 1000 == 0:
-                                    print(f"[ADAPTIVE GATING] Step {self.debug_step}: View spatial_var={view_spatial_var:.4f} < 0.1, reducing gate by 50%")
-                    
-                    # [PRIORITY 2 FIX] 确保View特征有最小贡献，防止View Mask完全黑色
-                    # 问题：门控机制可能过于保守，导致View特征被完全mask掉
-                    # 解决：提高最小gate值，确保View特征有更大贡献（从0.1提高到0.25）
-                    min_gate_value = 0.25  # [FIX] 从0.1提高到0.25，确保View特征有更大贡献
-                    gate = torch.clamp(gate, min=min_gate_value, max=1.0)
-                    
-                    refined_view = aligned_view * gate  # [FIX] Use aligned_view instead of value_view
-                    
-                    # [PRIORITY 2] Store gate losses for later aggregation (will be added to total loss)
-                    if not hasattr(self, '_gate_losses'):
-                        self._gate_losses = []
-                    self._gate_losses.append({
-                        'sparsity': gate_sparsity_loss,
-                        'variance': gate_variance_loss
-                    })
+                    refined_view = value_view * gate
                     gate_values = gate  # Save for visualization
-
-                # 为了诊断方便，在 BEV 空间上构造一个简单的“融合特征”用于可视化
-                if value_lidar is not None:
-                    lidar_vis = F.layer_norm(value_lidar, value_lidar.shape[-1:])
-                    base_view = refined_view if refined_view is not None else value_view
-                    view_vis = F.layer_norm(base_view, base_view.shape[-1:])
-                    # 这里使用 0.5/0.5 等权，仅用于可视化，与真实解码器权重解耦
-                    fused_feature_for_vis = 0.5 * lidar_vis + 0.5 * view_vis
 
             # [DEBUG ADDITION]
             if self.training:
-                # Pass both Lidar (value_lidar) and View (refined_view OR value_view)
-                # We prefer showing refined_view if gating is ON, to see what actually goes into fusion
-                vis_view = refined_view if refined_view is not None else value_view
-                self.visualize_reference_points(
-                    reference_points,
-                    lid,
-                    feature_map=value_lidar,
-                    feature_map_view=vis_view,
-                    spatial_shapes=kwargs.get('spatial_shapes', None),
-                    input_lidar_img=kwargs.get('input_lidar_img', None),  # [DEBUG VIS] Pass input images
-                    input_view_img=kwargs.get('input_view_img', None)  # [DEBUG VIS]
+                 # Pass both Lidar (value_lidar) and View (refined_view OR value_view)
+                 # We prefer showing refined_view if gating is ON, to see what actually goes into fusion
+                 vis_view = refined_view if refined_view is not None else value_view
+                 self.visualize_reference_points(
+                     reference_points, 
+                     lid, 
+                     feature_map=kwargs.get('value', None), # This is usually 'current_value' from PREVIOUS layer logic? Wait, kwargs['value'] is updated at end of loop.
+                     # Actually 'value_lidar' is constant across layers as "Memory".
+                     # The decoder usually takes 'memory' as input. 
+                     # Let's visualize the RAW Inputs to this layer fusion.
+                     # Lidar = value_lidar
+                     feature_map_view=vis_view,
+                     spatial_shapes=kwargs.get('spatial_shapes', None),
+                     input_lidar_img=kwargs.get('input_lidar_img', None),  # [DEBUG VIS] Pass input images
+                     input_view_img=kwargs.get('input_view_img', None)  # [DEBUG VIS]
                 )
 
             if value_view is not None:
@@ -1411,305 +1119,167 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                     if lid >= self.split_layer_index:
                         current_value = refined_view
             
-            # [FIXED] Dual Cross Attention: 正确实现 - 只执行cross attention两次，self-attn和FFN只执行一次
+            # [NEW] Dual Cross Attention: Query attends to Lidar (main) and View (auxiliary) separately
             if self.use_dual_cross_attn and value_view is not None and value_lidar is not None:
-                # 确保output形状正确 (num_query, bs, embed_dims)
+                # [FIX] Ensure output is in correct shape (num_query, bs, embed_dims) for layer
+                # output should be (num_query, bs, embed_dims) at the start of each layer iteration
+                # Check and fix output shape if needed
                 if output.dim() == 3:
-                    num_query_expected = query.shape[0]
-                    if output.shape[0] != num_query_expected and output.shape[1] == num_query_expected:
-                        output = output.permute(1, 0, 2)
-
+                    num_query_expected = query.shape[0]  # Expected num_query dimension
+                    if output.shape[0] != num_query_expected:
+                        # If output is (bs, num_query, embed_dims), convert to (num_query, bs, embed_dims)
+                        if output.shape[1] == num_query_expected:
+                            output = output.permute(1, 0, 2)
+                        else:
+                            # Unexpected shape, try to infer
+                            raise RuntimeError(f"Unexpected output shape: {output.shape}, expected first dim to be {num_query_expected}")
+                
+                # Save original output for residual connection
+                output_orig = output
                 reference_points_input = reference_points[..., :2].unsqueeze(2)
                 view_mask = kwargs.get('view_mask', None)
-                view_key_padding_mask = view_mask if view_mask is not None else key_padding_mask
-
-                # ============ 正确的Dual Cross Attention实现 ============
-                # 获取layer内部的attention和ffn模块
-                # DetrTransformerDecoderLayer的operation_order: ('self_attn', 'norm', 'cross_attn', 'norm', 'ffn', 'norm')
-                # 
-                # [IMPORTANT] 实现逻辑：
-                # 1. Self-Attention: 只执行一次（query attends to itself）
-                # 2. Dual Cross-Attention: 使用同一个cross_attn模块，分别对Lidar和View执行
-                #    - 注意：这要求cross_attn是无状态的，可以安全地多次调用
-                # 3. 融合两个cross-attention的输出
-                # 4. FFN: 只执行一次
-                #
-                # [FIX] 检查layer是否有必要的属性，以及是否支持pre-norm
-                has_attentions = hasattr(layer, 'attentions') and len(layer.attentions) > 0
-                has_norms = hasattr(layer, 'norms') and len(layer.norms) > 0
-                has_ffns = hasattr(layer, 'ffns') and len(layer.ffns) > 0
-                pre_norm = getattr(layer, 'pre_norm', False)  # 检查是否使用pre-norm
                 
-                # [DEBUG] 验证layer结构
-                if self.training and self.debug_step % 1000 == 0 and lid == 0:
-                    print(f"[DUAL ATTENTION DEBUG] Layer {lid}: has_attentions={has_attentions}, "
-                          f"has_norms={has_norms}, has_ffns={has_ffns}, pre_norm={pre_norm}")
-                    if has_attentions:
-                        print(f"[DUAL ATTENTION DEBUG] attentions count: {len(layer.attentions)}")
-                    if hasattr(layer, 'operation_order'):
-                        print(f"[DUAL ATTENTION DEBUG] operation_order: {layer.operation_order}")
-                
-                if not has_attentions or not has_norms or not has_ffns:
-                    # [FALLBACK] 如果无法访问内部属性，回退到标准layer调用
-                    # 这种情况下，我们只能对融合后的特征执行一次cross attention
-                    kwargs['value'] = current_value
-                    output = layer(output, *args, reference_points=reference_points_input,
-                                  key_padding_mask=key_padding_mask, **kwargs)
-                    output = output.permute(1, 0, 2)  # (bs, num_query, embed_dims)
-                else:
-                    # Step 1: Self-Attention (只执行一次)
-                    identity = output  # 保存用于residual连接
-                    self_attn = layer.attentions[0]
-                    query_pos = kwargs.get('query_pos', None)
-
-                    # Self-attention: query attends to itself
-                    # [FIX] 根据pre_norm决定identity的传递方式
-                    output_self = self_attn(
-                        query=output,
-                        key=output,
-                        value=output,
-                        identity=identity if pre_norm else None,  # pre-norm: identity在之前传入
-                        query_pos=query_pos,
-                        key_pos=query_pos,
-                        attn_mask=None,
-                        key_padding_mask=None
-                    )
-                    
-                    # [FIX] 根据pre_norm决定residual连接方式
-                    if pre_norm:
-                        # pre-norm: attention输出直接使用，norm在residual之后
-                        output = output_self
-                    else:
-                        # post-norm: attention输出 + residual，然后norm
-                        output = output_self + identity
-                    
-                    # 应用第一个norm (在self_attn之后)
-                    output = layer.norms[0](output)
-                    identity = output  # 更新identity用于下一个操作
-
-                    # Step 2: Dual Cross-Attention
-                    # [VERIFIED] 使用同一个cross_attn模块，但分别对Lidar和View执行
-                    # 验证：CustomMSDeformableAttention是无状态的（forward方法不修改self属性）
-                    # - 所有操作都是函数式的
-                    # - 没有缓存、计数器等运行时状态
-                    # - 唯一潜在问题：Dropout在训练时的随机性（但这通常是有益的正则化）
-                    # 结论：可以安全地多次调用同一个cross_attn模块
-                    cross_attn = layer.attentions[1]
-                    
-                    # 2a: Cross-attention to Lidar (主模态)
-                    # [FIX] 准备Lidar的kwargs，移除所有显式传递的参数，避免冲突
+                # [IMPROVED] Process Lidar first (main modality), then View (auxiliary)
+                if self.lidar_first:
+                    # Step 1: Query attends to Lidar features (main modality)
                     kwargs_lidar = kwargs.copy()
-                    kwargs_lidar.pop('key_padding_mask', None)  # 移除，使用显式参数
-                    kwargs_lidar.pop('view_mask', None)
-                    kwargs_lidar.pop('value', None)  # 移除旧的value，使用新的value_lidar
-                    kwargs_lidar.pop('key', None)  # 移除key，避免与显式key=None冲突
-                    kwargs_lidar.pop('query', None)  # 移除query，使用显式参数
-                    kwargs_lidar.pop('query_pos', None)  # 移除query_pos，使用显式参数
-                    kwargs_lidar.pop('identity', None)  # 移除identity，使用显式参数
-                    kwargs_lidar.pop('reference_points', None)  # 移除reference_points，使用显式参数
-                    kwargs_lidar.pop('spatial_shapes', None)  # 移除spatial_shapes，使用显式参数
-                    kwargs_lidar.pop('level_start_index', None)  # 移除level_start_index，使用显式参数
+                    kwargs_lidar['value'] = value_lidar
+                    # [FIX] Remove key_padding_mask from kwargs to avoid duplicate argument
+                    kwargs_lidar.pop('key_padding_mask', None)
                     
-                    # [FIX] 根据pre_norm决定identity传递
-                    # CustomMSDeformableAttention在最后会执行: return self.dropout(output) + identity
-                    # - 如果identity=None，会使用query作为identity
-                    # - pre_norm: 传入identity（self_attn后的output），attention会加identity
-                    # - post_norm: 传入None，attention会使用query作为identity（即self_attn后的output）
-                    # 所以两种情况下，attention输出都包含了residual连接
-                    cross_attn_identity = identity if pre_norm else None
-                    
-                    output_lidar = cross_attn(
-                        query=output,
-                        key=None,  # CustomMSDeformableAttention不使用key参数
-                        value=value_lidar,  # [FIX] 直接传递value参数，shape应该是 (Len, BS, C)
-                        identity=cross_attn_identity,
-                        query_pos=kwargs.get('query_pos', None),
-                        key_padding_mask=key_padding_mask,
+                    output_lidar = layer(
+                        output,  # (num_query, bs, embed_dims)
+                        *args,
                         reference_points=reference_points_input,
-                        spatial_shapes=kwargs.get('spatial_shapes', None),
-                        level_start_index=kwargs.get('level_start_index', None),
-                        **kwargs_lidar
-                    )
+                        key_padding_mask=key_padding_mask,  # Pass explicitly
+                        **kwargs_lidar)
+                    output_lidar = output_lidar.permute(1, 0, 2)  # (bs, num_query, embed_dims)
                     
-                    # 2b: Cross-attention to View (辅助模态)
-                    # [FIX] 使用相同的query和cross_attn，但不同的value
-                    view_value = refined_view if refined_view is not None else value_view
+                    # [NEW] Modality Interaction: Use Lidar output to guide View attention
+                    if self.use_modality_interaction:
+                        # Extract query features from Lidar output for interaction
+                        query_for_view = output_lidar  # (bs, num_query, embed_dims)
+                    else:
+                        query_for_view = output.permute(1, 0, 2)  # Original query
+                    
+                    # Step 2: Query attends to View features (auxiliary modality)
                     kwargs_view = kwargs.copy()
-                    kwargs_view.pop('key_padding_mask', None)  # 移除，使用显式参数
-                    kwargs_view.pop('view_mask', None)
-                    kwargs_view.pop('value', None)  # 移除旧的value，使用新的view_value
-                    kwargs_view.pop('key', None)  # 移除key，避免与显式key=None冲突
-                    kwargs_view.pop('query', None)  # 移除query，使用显式参数
-                    kwargs_view.pop('query_pos', None)  # 移除query_pos，使用显式参数
-                    kwargs_view.pop('identity', None)  # 移除identity，使用显式参数
-                    kwargs_view.pop('reference_points', None)  # 移除reference_points，使用显式参数
-                    kwargs_view.pop('spatial_shapes', None)  # 移除spatial_shapes，使用显式参数
-                    kwargs_view.pop('level_start_index', None)  # 移除level_start_index，使用显式参数
+                    kwargs_view['value'] = refined_view if refined_view is not None else value_view
+                    # [FIX] Remove key_padding_mask from kwargs to avoid duplicate argument
+                    kwargs_view.pop('key_padding_mask', None)
+                    # Determine which mask to use
+                    view_key_padding_mask = view_mask if view_mask is not None else key_padding_mask
                     
-                    output_view = cross_attn(
-                        query=output,
-                        key=None,  # CustomMSDeformableAttention不使用key参数
-                        value=view_value,  # [FIX] 直接传递value参数，shape应该是 (Len, BS, C)
-                        identity=cross_attn_identity,  # 使用相同的identity
-                        query_pos=kwargs.get('query_pos', None),
-                        key_padding_mask=view_key_padding_mask,
+                    # Use query_for_view (may be enhanced by Lidar output)
+                    output_view = layer(
+                        query_for_view.permute(1, 0, 2),  # Convert to (num_query, bs, embed_dims)
+                        *args,
                         reference_points=reference_points_input,
-                        spatial_shapes=kwargs.get('spatial_shapes', None),
-                        level_start_index=kwargs.get('level_start_index', None),
-                        **kwargs_view
-                    )
-
-                    # Step 3: 融合两个cross-attention的输出
-                    # 转换为 (bs, num_query, embed_dims) 进行融合
-                    output_lidar_t = output_lidar.permute(1, 0, 2)
-                    output_view_t = output_view.permute(1, 0, 2)
-
-                    # 计算融合权重
-                    if self.use_adaptive_weights:
-                        # [FIX] Layer Norm仅用于计算权重和尺度匹配，但融合时使用原始特征
-                        # 避免双重归一化：融合前归一化用于权重计算，融合后由layer.norms[1]统一归一化
-                        # [FIX] 关于residual连接和梯度流的说明：
-                        # - output_lidar_t和output_view_t已经包含了residual（来自CustomMSDeformableAttention）
-                        # - 归一化用于权重计算，虽然会影响梯度流，但这是有益的（归一化本身就是为了稳定训练）
-                        # - 融合时使用原始特征（output_lidar_t, output_view_t），保持residual连接的完整性
-                        # - 融合后由layer.norms[1]统一归一化，这是标准的Transformer做法
-                        # 注意：归一化操作是可微的，梯度可以正常反向传播，不会"破坏"residual连接
-                        output_lidar_norm = F.layer_norm(output_lidar_t, output_lidar_t.shape[-1:])
-                        output_view_norm = F.layer_norm(output_view_t, output_view_t.shape[-1:])
-                        concat_feat = torch.cat([output_lidar_norm, output_view_norm], dim=-1)
-                        weights = self.adaptive_weight_module(concat_feat)
-                        lidar_weight = weights[..., 0:1]
-                        view_weight = weights[..., 1:2]
-                        
-                        # [PRIORITY 3 FIX] 防止Lidar过度主导，强制权重平衡
-                        # 问题：自适应权重学习可能过度偏向Lidar（0.7-0.75 vs 0.2-0.25）
-                        # 解决：缩小权重范围到[0.4, 0.6]，强制更平衡的融合
-                        lidar_weight = torch.clamp(lidar_weight, min=0.4, max=0.6)  # [FIX] 从[0.3, 0.7]缩小到[0.4, 0.6]
-                        view_weight = 1.0 - lidar_weight  # 确保权重和为1.0
-                        # [DEBUG] 监控权重平衡效果
-                        if self.training and self.debug_step % 1000 == 0:
-                            print(f"[WEIGHT BALANCE] Step {self.debug_step}, Layer {lid}: "
-                                  f"lidar_weight={lidar_weight.mean().item():.4f} (range: [{lidar_weight.min().item():.4f}, {lidar_weight.max().item():.4f}]), "
-                                  f"view_weight={view_weight.mean().item():.4f} (range: [{view_weight.min().item():.4f}, {view_weight.max().item():.4f}])")
-                        
-                        # [NEW] 可视化自适应融合权重
-                        if self.training:
-                            self.visualize_adaptive_weights(
-                                lidar_weight, view_weight, reference_points, lid,
-                                gt_bboxes_3d=kwargs.get('gt_bboxes_3d', None),
-                                spatial_shapes=kwargs.get('spatial_shapes', None)
-                            )
-                        
-                        # [FIX] 使用原始特征进行融合，避免双重归一化
-                        # 归一化仅用于权重计算，融合后由layer.norms[1]统一归一化
-                        fused_cross = lidar_weight * output_lidar_t + view_weight * output_view_t
-                        
-                        # [NEW] 可视化融合前后特征对比（使用归一化后的特征用于可视化）
-                        if self.training:
-                            self.visualize_feature_comparison(
-                                output_lidar_norm, output_view_norm, 
-                                F.layer_norm(fused_cross, fused_cross.shape[-1:]),  # 临时归一化用于可视化
-                                reference_points, lid,
-                                gt_bboxes_3d=kwargs.get('gt_bboxes_3d', None),
-                                spatial_shapes=kwargs.get('spatial_shapes', None)
-                            )
-                    else:
-                        # 渐进式融合或固定权重
-                        num_layers = len(self.layers)
-                        if self.use_gradual:
-                            view_weight = float(lid) / float(num_layers - 1) if num_layers > 1 else 0.5
-                            lidar_weight = 1.0 - view_weight
-                        else:
-                            lidar_weight, view_weight = 0.7, 0.3  # Lidar主导
-
-                        # [FIX] 直接使用原始特征进行融合，避免双重归一化
-                        # 融合后由layer.norms[1]统一归一化（标准Transformer做法）
-                        fused_cross = lidar_weight * output_lidar_t + view_weight * output_view_t
-                        
-                        # [NEW] 对于非adaptive weights情况，也收集权重用于可视化
-                        if self.training:
-                            # 创建权重tensor用于可视化
-                            lidar_weight_tensor = torch.full((output_lidar_t.shape[0], output_lidar_t.shape[1], 1), 
-                                                             lidar_weight, device=output_lidar_t.device)
-                            view_weight_tensor = torch.full((output_view_t.shape[0], output_view_t.shape[1], 1),
-                                                            view_weight, device=output_view_t.device)
-                            
-                            # 可视化融合前后特征对比（临时归一化用于可视化）
-                            output_lidar_norm_vis = F.layer_norm(output_lidar_t, output_lidar_t.shape[-1:])
-                            output_view_norm_vis = F.layer_norm(output_view_t, output_view_t.shape[-1:])
-                            fused_cross_norm_vis = F.layer_norm(fused_cross, fused_cross.shape[-1:])
-                            self.visualize_feature_comparison(
-                                output_lidar_norm_vis, output_view_norm_vis, fused_cross_norm_vis, 
-                                reference_points, lid,
-                                gt_bboxes_3d=kwargs.get('gt_bboxes_3d', None),
-                                spatial_shapes=kwargs.get('spatial_shapes', None)
-                            )
-
-                    # 转回 (num_query, bs, embed_dims)
-                    fused_cross = fused_cross.permute(1, 0, 2)
-
-                    # [FIX] 应用cross-attention后的norm (第二个norm)
-                    # 注意：CustomMSDeformableAttention已经在最后执行了: return self.dropout(output) + identity
-                    # - pre_norm: output_lidar = attention_output + identity（identity是self_attn后的output）
-                    # - post_norm: output_lidar = attention_output + query（query是self_attn后的output）
-                    # 所以output_lidar和output_view都已经包含了residual连接
-                    # 融合后：fused_cross = lidar_weight * output_lidar + view_weight * output_view
-                    # 这个fused_cross已经包含了residual，现在统一归一化（避免双重归一化）
-                    # 融合前如果做了归一化，仅用于权重计算，融合使用原始特征
+                        key_padding_mask=view_key_padding_mask,  # Pass explicitly
+                        **kwargs_view)
+                    output_view = output_view.permute(1, 0, 2)  # (bs, num_query, embed_dims)
+                else:
+                    # Original order: View first, then Lidar
+                    kwargs_view = kwargs.copy()
+                    kwargs_view['value'] = refined_view if refined_view is not None else value_view
+                    # [FIX] Remove key_padding_mask from kwargs to avoid duplicate argument
+                    kwargs_view.pop('key_padding_mask', None)
+                    view_key_padding_mask = view_mask if view_mask is not None else key_padding_mask
                     
-                    # [PRIORITY 3] Check normalization initialization (debug mode)
-                    if self.training and self.debug_step % 5000 == 0 and lid == 0:
-                        norm_weight = layer.norms[1].weight.data[:3] if hasattr(layer.norms[1], 'weight') else None
-                        norm_bias = layer.norms[1].bias.data[:3] if hasattr(layer.norms[1], 'bias') else None
-                        print(f"[NORM CHECK] Step {self.debug_step}, Layer {lid}: norm[1] weight={norm_weight}, bias={norm_bias}")
-                        print(f"  fused_cross before norm: mean={fused_cross.mean():.4f}, std={fused_cross.std():.4f}")
+                    output_view = layer(
+                        output,
+                        *args,
+                        reference_points=reference_points_input,
+                        key_padding_mask=view_key_padding_mask,  # Pass explicitly
+                        **kwargs_view)
+                    output_view = output_view.permute(1, 0, 2)
                     
-                    output = layer.norms[1](fused_cross)
+                    kwargs_lidar = kwargs.copy()
+                    kwargs_lidar['value'] = value_lidar
+                    # [FIX] Remove key_padding_mask from kwargs to avoid duplicate argument
+                    kwargs_lidar.pop('key_padding_mask', None)
                     
-                    # [PRIORITY 3] Check normalization output (debug mode)
-                    if self.training and self.debug_step % 5000 == 0 and lid == 0:
-                        print(f"  output after norm: mean={output.mean():.4f}, std={output.std():.4f}")
-                    identity = output  # 更新identity用于FFN
-
-                # Step 4: FFN (只执行一次)
-                if has_ffns:
-                    # [FIX] FFN的调用方式：FFN可能接受identity参数（pre_norm）或需要手动加residual（post_norm）
-                    # 检查FFN的forward签名
-                    ffn_identity = identity if pre_norm else None
-                    try:
-                        # 尝试传递identity参数（如果FFN支持pre_norm）
-                        ffn_output = layer.ffns[0](output, ffn_identity)
-                    except TypeError:
-                        # 如果FFN不支持identity参数，手动处理
-                        ffn_output = layer.ffns[0](output)
-                        if not pre_norm:
-                            ffn_output = ffn_output + identity
-                    
-                    # [FIX] 应用FFN后的norm (第三个norm)
-                    # pre_norm: ffn_output已经包含了residual（如果FFN支持），直接norm
-                    # post_norm: ffn_output已经手动加了residual，直接norm
-                    output = layer.norms[2](ffn_output)
-
-                # 转换为 (bs, num_query, embed_dims) 用于reg_branches
-                output = output.permute(1, 0, 2)
+                    output_lidar = layer(
+                        output_view.permute(1, 0, 2),
+                        *args,
+                        reference_points=reference_points_input,
+                        key_padding_mask=key_padding_mask,  # Pass explicitly
+                        **kwargs_lidar)
+                    output_lidar = output_lidar.permute(1, 0, 2)
                 
-                # [NEW] 收集数据用于逐层追踪可视化
-                if self.training:
-                    # 保存当前层的输出、reference points和权重
-                    all_layer_outputs_for_vis.append(output.clone().detach())
-                    all_reference_points_for_vis.append(reference_points.clone().detach())
-                    # 保存权重（如果存在）
-                    if 'lidar_weight' in locals() and 'view_weight' in locals():
-                        if isinstance(lidar_weight, torch.Tensor):
-                            all_weights_for_vis.append((lidar_weight.clone().detach(), view_weight.clone().detach()))
-                        else:
-                            # 对于float类型的权重，创建tensor
-                            lidar_w_tensor = torch.tensor(lidar_weight, device=output.device)
-                            view_w_tensor = torch.tensor(view_weight, device=output.device)
-                            all_weights_for_vis.append((lidar_w_tensor, view_w_tensor))
+                # Step 3: Fuse outputs from Lidar and View attention
+                # Normalize features before fusion
+                output_lidar_norm = F.layer_norm(output_lidar, output_lidar.shape[-1:])
+                output_view_norm = F.layer_norm(output_view, output_view.shape[-1:])
+                
+                # [NEW] Adaptive Weight Learning: Learn weights based on features
+                if self.use_adaptive_weights:
+                    # Concatenate normalized features to predict weights
+                    concat_feat = torch.cat([output_lidar_norm, output_view_norm], dim=-1)  # (bs, num_query, 2*embed_dims)
+                    # Average over query dimension to get global feature
+                    global_feat = concat_feat.mean(dim=1)  # (bs, 2*embed_dims)
+                    weights = self.adaptive_weight_module(global_feat)  # (bs, 2) -> [lidar_weight, view_weight]
+                    # Expand to match query dimension
+                    weights = weights.unsqueeze(1)  # (bs, 1, 2)
+                    lidar_weight = weights[..., 0:1]  # (bs, 1, 1)
+                    view_weight = weights[..., 1:2]  # (bs, 1, 1)
+                    # [VIS] Save for visualization
+                    self._last_adaptive_weights = weights  # (bs, 1, 2)
+                elif self.use_gradual:
+                    # Gradual fusion weights (layer-dependent)
+                    num_layers = len(self.layers)
+                    view_weight_val = float(lid) / float(num_layers - 1) if num_layers > 1 else 1.0
+                    view_weight_val = min(max(view_weight_val, 0.0), 1.0)
+                    lidar_weight_val = 1.0 - view_weight_val
+                    lidar_weight = lidar_weight_val
+                    view_weight = view_weight_val
+                else:
+                    # Fixed weights (favor Lidar as main modality)
+                    lidar_weight = 0.6
+                    view_weight = 0.4
+                
+                # [NEW] Conditional Fusion: Query-dependent modality gating
+                if self.use_conditional_fusion:
+                    # Use fused output (before final permute) to predict modality gates
+                    # output_lidar_norm and output_view_norm are both (bs, num_query, embed_dims)
+                    # Use their average or concatenation to get query representation
+                    query_flat = (output_lidar_norm + output_view_norm) / 2.0  # (bs, num_query, embed_dims)
+                    query_global = query_flat.mean(dim=1)  # (bs, embed_dims)
+                    modality_gates = self.conditional_fusion(query_global)  # (bs, 2) -> [lidar_gate, view_gate]
+                    lidar_gate = modality_gates[:, 0:1].unsqueeze(1)  # (bs, 1, 1)
+                    view_gate = modality_gates[:, 1:2].unsqueeze(1)  # (bs, 1, 1)
+                    
+                    # Apply gates to weights
+                    if isinstance(lidar_weight, float):
+                        lidar_weight = lidar_weight * lidar_gate
                     else:
-                        all_weights_for_vis.append(None)
-
+                        lidar_weight = lidar_weight * lidar_gate
+                    if isinstance(view_weight, float):
+                        view_weight = view_weight * view_gate
+                    else:
+                        view_weight = view_weight * view_gate
+                    
+                    # Renormalize
+                    total_weight = lidar_weight + view_weight
+                    lidar_weight = lidar_weight / (total_weight + 1e-8)
+                    view_weight = view_weight / (total_weight + 1e-8)
+                
+                # Weighted fusion
+                if isinstance(lidar_weight, float):
+                    output = lidar_weight * output_lidar_norm + view_weight * output_view_norm
+                else:
+                    output = lidar_weight * output_lidar_norm + view_weight * output_view_norm
+                
+                # [NEW] Modality Interaction: Cross-modal enhancement
+                if self.use_modality_interaction and not self.lidar_first:
+                    # Enhance fused output with cross-modal interaction
+                    concat_output = torch.cat([output_lidar_norm, output_view_norm], dim=-1)
+                    interaction_feat = self.modality_interaction(concat_output)
+                    output = output + 0.1 * interaction_feat  # Residual connection with small weight
+                
+                # [FIX] output is currently (bs, num_query, embed_dims)
+                # Keep it as (bs, num_query, embed_dims) for reg_branches
+                # Then convert to (num_query, bs, embed_dims) for next layer
             else:
                 # Original single cross attention (fused features)
                 # Update kwargs locally for this layer call
@@ -1747,25 +1317,25 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
 
             # [DEBUG ADDITION]
             if self.training:
-                # Pass both Lidar (value_lidar) and View (refined_view OR value_view)
-                # We prefer showing refined_view if gating is ON, to see what actually goes into fusion
-                vis_view = refined_view if refined_view is not None else value_view
-                
-                # Get view mask from kwargs if available
-                view_mask_vis = kwargs.get('view_mask', None)
-                
-                self.visualize_reference_points(
-                    reference_points, 
-                    lid, 
-                    feature_map=value_lidar, 
-                    feature_map_view=vis_view,
-                    spatial_shapes=kwargs.get('spatial_shapes', None),
-                    gt_bboxes_3d=kwargs.get('gt_bboxes_3d', None),
-                    gate_values=gate_values,
-                    fused_feature=fused_feature_for_vis,
-                    view_mask=view_mask_vis,
-                    input_lidar_img=kwargs.get('input_lidar_img', None),
-                    input_view_img=kwargs.get('input_view_img', None)
+                 # Pass both Lidar (value_lidar) and View (refined_view OR value_view)
+                 # We prefer showing refined_view if gating is ON, to see what actually goes into fusion
+                 vis_view = refined_view if refined_view is not None else value_view
+                 
+                 # Get view mask from kwargs if available
+                 view_mask_vis = kwargs.get('view_mask', None)
+                 
+                 self.visualize_reference_points(
+                     reference_points, 
+                     lid, 
+                     feature_map=value_lidar, 
+                     feature_map_view=vis_view,
+                     spatial_shapes=kwargs.get('spatial_shapes', None),
+                     gt_bboxes_3d=kwargs.get('gt_bboxes_3d', None),
+                     gate_values=gate_values,
+                     fused_feature=current_value if value_view is not None else None,
+                     view_mask=view_mask_vis,
+                     input_lidar_img=kwargs.get('input_lidar_img', None),
+                     input_view_img=kwargs.get('input_view_img', None)
                 )
 
             # [FIX] output should be (num_query, bs, embed_dims) when appending to intermediate
@@ -1774,58 +1344,22 @@ class SplitModalityDecoder(VMADetectionTransformerDecoder):
                 intermediate.append(output)  # output is already (num_query, bs, embed_dims)
                 intermediate_reference_points.append(reference_points)
 
-        # [NEW] 可视化逐层融合效果追踪
-        if self.training and len(all_layer_outputs_for_vis) > 0:
-            self.visualize_layer_progression(
-                all_layer_outputs_for_vis, all_reference_points_for_vis, all_weights_for_vis,
-                gt_bboxes_3d=kwargs.get('gt_bboxes_3d', None)
-            )
-        
         # [DEBUG ADDITION]
         if self.training:
+            # Visualize layer progression
+            if self.return_intermediate and len(intermediate_reference_points) > 0:
+                self.visualize_layer_progression(
+                    intermediate_reference_points,
+                    kwargs.get('gt_bboxes_3d', None)
+                )
+            
             self.debug_step += 1
 
-        # [PRIORITY 2] Aggregate and store losses for later retrieval
-        if self.training:
-            # [REMOVED] 删除对齐损失聚合：对比损失不work，只保留Cross-Attention对齐模块
-            # Aggregate alignment losses
-            # if hasattr(self, '_alignment_losses') and len(self._alignment_losses) > 0:
-            #     total_alignment_loss = sum(self._alignment_losses) / len(self._alignment_losses)
-            #     self._total_alignment_loss = total_alignment_loss * self.alignment_loss_weight
-            # else:
-            #     self._total_alignment_loss = None
-            
-            # Aggregate gate losses
-            if hasattr(self, '_gate_losses') and len(self._gate_losses) > 0:
-                total_gate_sparsity = sum([g['sparsity'] for g in self._gate_losses]) / len(self._gate_losses)
-                total_gate_variance = sum([g['variance'] for g in self._gate_losses]) / len(self._gate_losses)
-                self._total_gate_sparsity_loss = total_gate_sparsity * self.gate_loss_weight
-                self._total_gate_variance_loss = total_gate_variance * self.gate_loss_weight
-            else:
-                self._total_gate_sparsity_loss = None
-                self._total_gate_variance_loss = None
-        
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(
                 intermediate_reference_points)
 
         return output, reference_points
-    
-    def get_fusion_losses(self):
-        """
-        [PRIORITY 2] Get fusion-related losses (gating losses only)
-        [REMOVED] 对齐损失已删除：对比损失不work，只保留Cross-Attention对齐模块
-        Returns a dictionary of losses that should be added to the main loss dict
-        """
-        loss_dict = {}
-        # [REMOVED] 删除对齐损失
-        # if hasattr(self, '_total_alignment_loss') and self._total_alignment_loss is not None:
-        #     loss_dict['loss_alignment'] = self._total_alignment_loss
-        if hasattr(self, '_total_gate_sparsity_loss') and self._total_gate_sparsity_loss is not None:
-            loss_dict['loss_gate_sparsity'] = self._total_gate_sparsity_loss
-        if hasattr(self, '_total_gate_variance_loss') and self._total_gate_variance_loss is not None:
-            loss_dict['loss_gate_variance'] = self._total_gate_variance_loss
-        return loss_dict
 
 
 @TRANSFORMER.register_module()
@@ -1914,15 +1448,12 @@ class SplitModalityTransformer(DeformableDetrTransformer):
             feat_flatten_view = []
             mask_flatten_view_list = []
             
-            # [FIX] Ensure View features are spatially aligned with Lidar features
-            # Critical: View features must have the same spatial dimensions as Lidar
-            import torch.nn.functional as F
-            
             # [FIX] Generate View mask similar to Lidar mask (based on img_shape from img_metas)
             # Reference: vmahead.py 
             mlvl_masks_view = None
             if kwargs.get('img_metas', None) is not None:
                 img_metas = kwargs.get('img_metas')
+                import torch.nn.functional as F
                 input_img_h, input_img_w = img_metas[0]['img_shape']
                 # Create mask: 1=invalid (padding), 0=valid
                 # Same logic as lidar mask generation
@@ -1932,54 +1463,13 @@ class SplitModalityTransformer(DeformableDetrTransformer):
                     img_masks_view[img_id, :img_h, :img_w] = 0
                 
                 mlvl_masks_view = []
-                for lvl, feat_view in enumerate(mlvl_feats_view):
-                    # [FIX] First align View feature size to Lidar feature size
-                    # NOTE: View features should already be aligned in vmahead.py
-                    # This is a safety check for mask generation
-                    feat_lidar = mlvl_feats[lvl]  # Get corresponding Lidar feature
-                    lidar_h, lidar_w = feat_lidar.shape[-2:]
-                    view_h, view_w = feat_view.shape[-2:]
-                    
-                    # Interpolate View feature to match Lidar spatial dimensions (safety fallback)
-                    if (view_h, view_w) != (lidar_h, lidar_w):
-                        # This should rarely happen if vmahead.py alignment works correctly
-                        feat_view = F.interpolate(
-                            feat_view, 
-                            size=(lidar_h, lidar_w), 
-                            mode='bilinear',  # Match vmahead.py interpolation mode
-                            align_corners=False  # Match vmahead.py align_corners setting
-                        )
-                    
-                    # Interpolate mask to match feature map size (after alignment)
-                    mask_view = F.interpolate(
-                        img_masks_view.unsqueeze(1).float(), 
-                        size=(lidar_h, lidar_w)
-                    ).to(torch.bool).squeeze(1)
+                for feat_view in mlvl_feats_view:
+                    # Interpolate mask to match feature map size
+                    mask_view = F.interpolate(img_masks_view[None], size=feat_view.shape[-2:]).to(torch.bool).squeeze(0)
                     mlvl_masks_view.append(mask_view)
             
-            # [FIX] Process View features with spatial alignment check
-            # NOTE: View features should already be aligned in vmahead.py (interpolate + high_res_smoothing)
-            # This is a safety check to ensure alignment, but should rarely trigger if vmahead.py works correctly
             for lvl, feat in enumerate(mlvl_feats_view):
-                # [FIX] Ensure View feature matches Lidar spatial dimensions
-                feat_lidar = mlvl_feats[lvl]
-                lidar_h, lidar_w = feat_lidar.shape[-2:]
-                view_h, view_w = feat.shape[-2:]
-                
-                # [DEBUG] Log spatial dimension mismatch (should be rare if vmahead.py alignment works)
-                if (view_h, view_w) != (lidar_h, lidar_w):
-                    if self.training and lvl == 0:  # Only log for first level to avoid spam
-                        print(f"[WARNING] Level {lvl}: View ({view_h}, {view_w}) != Lidar ({lidar_h}, {lidar_w})")
-                        print(f"[WARNING] This suggests vmahead.py alignment may have failed. Re-aligning in split_modules...")
-                    # [FIX] Align View feature to Lidar dimensions (safety fallback)
-                    # Use same interpolation method as vmahead.py for consistency
-                    feat = F.interpolate(
-                        feat, 
-                        size=(lidar_h, lidar_w), 
-                        mode='bilinear',  # Match vmahead.py interpolation mode
-                        align_corners=False  # Match vmahead.py align_corners setting
-                    )
-                
+                # Assume alignment with Lidar
                 feat = feat.flatten(2).transpose(1, 2)  # (BS, H*W, C)
                 
                 # [FIX] Use View mask similar to Lidar mask (based on img_shape)
@@ -2007,18 +1497,16 @@ class SplitModalityTransformer(DeformableDetrTransformer):
             # Pass through View Encoder if it exists
             if self.encoder_view is not None:
                 # [FIX] Use View's own mask instead of Lidar mask
-                # [FIX] Ensure View uses the same spatial_shapes as Lidar (after alignment)
-                # After interpolation, View features should have the same spatial dimensions as Lidar
                 memory_view = self.encoder_view(
                     query=feat_flatten_view.permute(1, 0, 2), # (Len, BS, C)
                     key=None,
                     value=None,
-                    query_pos=lvl_pos_embed_flatten.permute(1, 0, 2), # [FIX] Reuse pos embeds (same spatial structure after alignment)
+                    query_pos=lvl_pos_embed_flatten.permute(1, 0, 2), # Reuse pos embeds
                     query_key_padding_mask=mask_flatten_view,          # [FIX] Use View mask
-                    spatial_shapes=spatial_shapes,  # [FIX] Use same spatial_shapes (after alignment, they match)
-                    level_start_index=level_start_index,  # [FIX] Same level_start_index (same spatial structure)
-                    valid_ratios=valid_ratios,  # [FIX] Could use View's own valid_ratios, but using Lidar's for consistency
-                    reference_points=reference_points,  # [FIX] Same reference points (same BEV space)
+                    spatial_shapes=spatial_shapes,
+                    level_start_index=level_start_index,
+                    valid_ratios=valid_ratios,
+                    reference_points=reference_points,
                     **kwargs
                 )
             else:

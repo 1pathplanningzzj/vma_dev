@@ -1,6 +1,3 @@
-from typing import Literal
-
-
 find_unused_parameters = True
 
 log_config = dict(
@@ -14,7 +11,7 @@ log_config = dict(
 # yapf:enable
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = "/homes/zhangzijian/vma_dev/train_result_/maptr_r101x2_dual-attn_adaptive-fusion_gram0.5_aligned/"
+work_dir = "/homes/zhangzijian/vma_dev/train_result_/mapTR_lidar_res101_view_res101_query_crossattn_encoder_Gating_Adaptive_Conditional_fusion_gram_loss_0/"
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
@@ -39,6 +36,7 @@ img_norm_cfg = dict(mean_lidar_map =[0.0442, 0.0919, 0.5470],
                     std_single=[33.3963],  
                     to_rgb=True)
 
+# 3D map classes
 map_classes = ['lane_line', 'curb', 'stop_line']
 
 ## trunk label
@@ -108,16 +106,20 @@ num_map_classes = len(map_classes)
 _dim_ = 256
 _ffn_dim_ = _dim_*2
 instance_num=50
-'''fuse_encoder=dict(
+'''
+fuse_encoder=dict(
         type='SimpleFusionEncoder',
         in_channels=6,  # 假设img和view_img都是3通道
         out_channels=3,
         conv_cfg=None,
-        norm_cfg=None),'''
-'''fuse_neck=dict(
+        norm_cfg=None),
+'''
+'''
+fuse_neck=dict(
         type='ViewFeatureFusion',
         in_channels=[512, 1024, 2048],
-        offset_channels=64),'''
+        offset_channels=64), 
+'''
 
 # =========== modality ===============
 task_config = dict(
@@ -157,14 +159,14 @@ model = dict(
 
     img_backbone_view=dict(
         type='ResNet',
-        depth=101,  # [CHANGED] Changed to ResNet-101 to match lidar backbone
+        depth=34, 
         num_stages=4,
-        out_indices=(1, 2, 3),  # Match lidar backbone format
-        frozen_stages=0,  # 从1改为0，让更多层可训练
-        norm_cfg=dict(type='BN', requires_grad=True),  # 关键：让BN可训练
-        norm_eval=False,  # 关键：训练时不冻结BN统计量
+        out_indices=(1,2,3,),
+        frozen_stages=1,
+        norm_cfg=dict(type='BN', requires_grad=False),
+        norm_eval=True,
         style='pytorch',
-        pretrained='/homes/zhangzijian/vma-dev/ckpts/resnet101-5d3b4d8f.pth'  # ResNet-101 pretrained weights
+        pretrained='/homes/zhangzijian/vma-dev/ckpts/resnet34-333f7ec4.pth'
         ),
 
     img_neck=dict(
@@ -178,7 +180,7 @@ model = dict(
 
     img_neck_view=dict(
         type='ChannelMapper',
-        in_channels=[512, 1024, 2048],  # [CHANGED] Match ResNet-101 output channels (was [256, 512, 1024] for ResNet-50)
+        in_channels=[128, 256, 512],          
         kernel_size=1,
         out_channels=256,
         act_cfg=None,
@@ -217,7 +219,6 @@ model = dict(
             encoder_view=dict(
                 type='DetrTransformerEncoder',
                 num_layers=6,
-                # 与上方 encoder 相同的结构，这里不需要类型注解，保持为普通 dict
                 transformerlayers=dict(
                     type='BaseTransformerLayer',
                     attn_cfgs=dict(
@@ -230,19 +231,18 @@ model = dict(
                 split_layer_index=3,
                 num_layers=6,
                 return_intermediate=True,
-                # Dual Cross Attention配置
-                use_dual_cross_attn=True,  # 启用正确实现的dual cross attention
-                lidar_first=True,
-                # 简化融合策略
-                use_adaptive_weights=True,  # 自适应权重学习
-                use_modality_interaction=False,  # 先关闭
-                use_conditional_fusion=False,  # 先关闭
-                # Gating配置
-                use_gating=True,
-                use_gradual=False,
-                gate_temperature=0.5,  # 更保守的gate值
-                use_adaptive_gating=True,
-                embed_dims=_dim_,
+                # [NEW] Dual Cross Attention: Query attends to Lidar and View separately
+                use_dual_cross_attn=True,  # Enable dual cross attention
+                lidar_first=True,  # Process Lidar (main) first, then View (auxiliary)
+                # [NEW] Advanced fusion strategies
+                use_adaptive_weights=True,  # Learn fusion weights adaptively
+                use_modality_interaction=True,  # Enable cross-modal interaction
+                use_conditional_fusion=True,  # Query-dependent modality selection
+                # Existing options
+                use_gating=True,  # Gate View features based on Lidar
+                use_gradual=False,  # Disable gradual fusion when using adaptive weights
+                gate_temperature=0.8,  # Conservative gate values
+                embed_dims=_dim_,  # Required for adaptive modules
                 transformerlayers=dict(
                     type='DetrTransformerDecoderLayer',
                     attn_cfgs=[
@@ -306,7 +306,7 @@ model = dict(
         loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.01), # 方向损失加大一点
         loss_offset=dict(type='LateralOffsetLoss',loss_weight=3.5),
         # loss_slope=dict(type='MSELoss', loss_weight=0.5), # 增加 斜率损失进行测试 
-        gram_loss_weight=0.5,  # 从0.0改为0.5，让View学习与Lidar对齐
+        gram_loss_weight=0.0,
 ),
     # model training and testing settings
     train_cfg=dict(pts=dict(
