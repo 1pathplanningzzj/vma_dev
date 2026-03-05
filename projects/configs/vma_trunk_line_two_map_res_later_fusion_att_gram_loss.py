@@ -1,5 +1,5 @@
 find_unused_parameters = True
-
+# python3 tools/test.py /homes/zhangzijian/vma_dev/projects/configs/vma_trunk_line_two_map_res_later_fusion_att_gram_loss.py /homes/zhangzijian/vma_dev/fusion_exp/spatial_fusion/epoch_144.pth --eval chamfer --eval-option show=True show_dir=visualize_result_fuse140  
 log_config = dict(
     interval=50,
     hooks=[
@@ -11,7 +11,7 @@ log_config = dict(
 # yapf:enable
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = "./new_data_train_result/new_data_categary_split_dataset_pt25_no_gram_loss"
+work_dir = "./fusion_exp/spatial_fusion_single_lidar"
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
@@ -119,17 +119,17 @@ instance_num=50
 # =========== modality ===============
 task_config = dict(
     with_lidar=True,
-    with_view=True,
+    with_view=False,
     with_z=False,
 )
 input_modality = dict(
     use_lidar_map=True,
-    use_view_map=True,
+    use_view_map=False,
     use_z_map=False, # npy file should be customed specially
 )
-# img_keys=["lidar_map"]
+img_keys=["lidar_map"]
 
-img_keys =["lidar_map", "view_map"]
+# img_keys =["lidar_map", "view_map"]
 # img_keys =["lidar_map", "view_map", "z_map"]
 
 model = dict(
@@ -306,7 +306,7 @@ dataset_type = 'TrunkLineDataset'
 data_root1 = dict(
     train="/homes/zhangzijian/vma-dev/data_1209_merged_split/train/",
     val="/homes/zhangzijian/vma-dev/data_1209_merged_split/val/",
-    test="/homes/zhangzijian/vma-dev/data_1209_merged_split/test/",
+    test="/homes/zhangzijian/vma-dev/data_1209_merged_split/val/",
 )
 # 新增第二个数据根目录（new_data）
 data_root2 = dict(

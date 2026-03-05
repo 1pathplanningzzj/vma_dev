@@ -48,7 +48,7 @@ class VMAHead(DETRHead):
                     remove_neg = True,
                     window_size = 3 
                  ),
-                gram_loss_weight=1.0,  # GramLoss权重
+                gram_loss_weight= 0.0,  # GramLoss权重
                  **kwargs):
 
         self.fp16_enabled = False
@@ -191,6 +191,7 @@ class VMAHead(DETRHead):
         reg_branch = nn.Sequential(*reg_branch)
 
         def _get_clones(module, N):
+            # 创建N个module的深拷贝，返回ModuleList
             return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
         # last reg_branch is used to generate proposal from
@@ -260,13 +261,14 @@ class VMAHead(DETRHead):
                 ):
         bs = mlvl_feats[0].shape[0]
         dtype = mlvl_feats[0].dtype
-        gram_loss = 0.0 
+        device = mlvl_feats[0].device
+        gram_loss = torch.tensor(0.0, device=device, dtype=dtype) 
         if mlvl_feats_view is not None:
             assert len(mlvl_feats) == len(mlvl_feats_view), "两个特征的尺度数量必须一致"
             mlvl_feats_fused = []
             for feat_lidar, feat_view in zip(mlvl_feats, mlvl_feats_view):
                 # 1. 拼接当前尺度的两个特征（通道维度：256+256=512）
-                feat_view_smoothed = self.high_res_smoothing(feat_view)
+                feat_view_smoothed = feat_view
                 
                 B, C, H, W = feat_lidar.shape
 
@@ -281,8 +283,6 @@ class VMAHead(DETRHead):
                 feat_view_reshaped = feat_view_smoothed.permute(0, 2, 3, 1).reshape(bs, -1, 256)
                 # 仅让view向lidar对齐，避免lidar被噪声污染
                 gram_loss += self.gram_loss(feat_view_reshaped, feat_lidar_reshaped.detach(), mask=mask, spatial_shape=(H, W))
-                # gram_loss = 0  
-
                 # 计算GramLoss（让主分支模仿View分支的关联模式，双向对齐）
 
                 concat_feat = torch.cat([feat_lidar, feat_view_smoothed], dim=1)  # [bs, 512, H, W]
@@ -296,67 +296,166 @@ class VMAHead(DETRHead):
 
                 fused = attn_weights[:, 0:1] * feat_lidar + attn_weights[:, 1:2] * feat_view_smoothed  # [bs, 256, H, W]
                 mlvl_feats_fused.append(fused)
+
+                 # ================== VISUALIZATION START (UPDATED) ==================
+                if len(mlvl_feats_fused) == 1:  # 只在 Scale 0 执行
+                    if not hasattr(self, 'vis_step_count'):
+                        self.vis_step_count = 0
+                    
+                    self.vis_step_count += 1
+                    
+                    # 每隔 100 step 可视化一次
+                    if self.vis_step_count % 100 == 0:
+                        import matplotlib.pyplot as plt
+                        import os
+                        import numpy as np
+                        import mmcv
+                        import cv2
+                        
+                        save_dir = 'debug_vis/fusion_debug'
+                        os.makedirs(save_dir, exist_ok=True)
+                        
+                        idx = 0  # Batch 0
+                        
+                        # --- 准备数据 ---
+                        
+                        # 1. Input Raw Images (Lidar Map & View Map)
+                        lidar_map_vis = np.zeros((100,100,3), dtype=np.uint8)
+                        view_map_vis = np.zeros((100,100,3), dtype=np.uint8)
+                        
+                        try:
+                            # img_metas[idx] 包含很多信息
+                            meta = img_metas[idx]
+                            
+                            # 调试信息保存
+                            if self.vis_step_count == 100 or self.vis_step_count == 200:
+                                debug_info_path = os.path.join(save_dir, f'step_{self.vis_step_count}_meta_debug.txt')
+                                with open(debug_info_path, 'w') as f:
+                                    f.write(f"Keys: {list(meta.keys())}\n")
+                                    if 'filename' in meta:
+                                        f.write(f"filename: {meta['filename']}\n")
+                                    if 'img_info' in meta:
+                                        f.write(f"img_info: {meta['img_info']}\n")
+
+                            # 策略：路径推断法 (Path Inference)
+                            # 已知 img_metas['filename'] 是 Lidar Map 的绝对路径: .../cropped_data/images/xxxx.jpg
+                            # 推断 View Map 路径: .../cropped_data/view_maps/xxxx.jpg
+                            
+                            lidar_path = None
+                            view_path = None
+                            
+                            raw_filename = meta.get('filename')
+                            if isinstance(raw_filename, list):
+                                if len(raw_filename) > 0:
+                                    raw_filename = raw_filename[0]
+                                else:
+                                    raw_filename = None
+                            
+                            if isinstance(raw_filename, str) and 'images' in raw_filename:
+                                lidar_path = raw_filename
+                                # 将 'images' 替换为 'view_maps'
+                                view_path = raw_filename.replace('images', 'view_maps')
+                                
+                                # 双重检查：确保文件真实存在
+                                if not os.path.exists(view_path):
+                                    # 尝试另一种常见命名: view_images
+                                    view_path_alt = raw_filename.replace('images', 'view_images')
+                                    if os.path.exists(view_path_alt):
+                                        view_path = view_path_alt
+                                    else:
+                                        # 如果都不存在，打印警告
+                                        print(f"Vis Warning: Inferred View Map path does not exist: {view_path}")
+
+                            # 读取图片
+                            if lidar_path and os.path.exists(lidar_path):
+                                img = mmcv.imread(lidar_path, channel_order='rgb')
+                                h, w = img.shape[:2]
+                                scale = 400.0 / max(h, w)
+                                lidar_map_vis = cv2.resize(img, (int(w*scale), int(h*scale)))
+                                
+                            if view_path and os.path.exists(view_path):
+                                img = mmcv.imread(view_path, channel_order='rgb')
+                                h, w = img.shape[:2]
+                                scale = 400.0 / max(h, w)
+                                view_map_vis = cv2.resize(img, (int(w*scale), int(h*scale)))
+
+                        except Exception as e:
+                            print(f"Vis Error reading maps: {e}")
+
+                        # 2. Lidar Feat (L2 Norm)
+                        # mask 已经在上面计算过: lidar_magnitude
+                        if 'lidar_magnitude' in locals():
+                            lidar_feat_vis = lidar_magnitude[idx].detach().cpu().numpy()
+                        else:
+                            lidar_feat_vis = torch.norm(feat_lidar[idx], p=2, dim=0).detach().cpu().numpy()
+
+                        # 3. View Feat (L2 Norm) - 统一使用 Norm 以便对比
+                        view_feat_vis = torch.norm(feat_view_smoothed[idx], p=2, dim=0).detach().cpu().numpy()
+                        
+                        # 4. 融合权重
+                        w_lidar = attn_weights[idx, 0].detach().cpu().numpy()
+                        w_view = attn_weights[idx, 1].detach().cpu().numpy()
+                        
+                        # 统计权重信息
+                        l_min, l_max, l_mean = w_lidar.min(), w_lidar.max(), w_lidar.mean()
+                        v_min, v_max, v_mean = w_view.min(), w_view.max(), w_view.mean()
+                        
+                        # 5. 融合结果 (L2 Norm) - 输出也统一用 Norm
+                        fused_vis = torch.norm(fused[idx], p=2, dim=0).detach().cpu().numpy()
+
+                        # --- 绘图 (7 列) ---
+                        fig, axes = plt.subplots(1, 7, figsize=(35, 5))
+                        
+                        # Col 1: Lidar Map (Input)
+                        axes[0].imshow(lidar_map_vis)
+                        axes[0].set_title('Input: Lidar Map')
+                        axes[0].axis('off')
+
+                        # Col 2: View Map (Input)
+                        axes[1].imshow(view_map_vis)
+                        axes[1].set_title('Input: View Map')
+                        axes[1].axis('off')
+                        
+                        # Col 3: Lidar Feat
+                        im2 = axes[2].imshow(lidar_feat_vis, cmap='viridis')
+                        axes[2].set_title('Feat: Lidar (Norm)')
+                        axes[2].axis('off')
+                        plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+                        # Col 4: View Feat
+                        im3 = axes[3].imshow(view_feat_vis, cmap='viridis')
+                        axes[3].set_title('Feat: View (Norm)')
+                        axes[3].axis('off')
+                        plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04)
+
+                        # Col 5: Weight Lidar
+                        im4 = axes[4].imshow(w_lidar, cmap='jet', vmin=0, vmax=1)
+                        axes[4].set_title(f'W:Lidar\n[{l_min:.2f}, {l_max:.2f}] μ={l_mean:.2f}')
+                        axes[4].axis('off')
+                        plt.colorbar(im4, ax=axes[4], fraction=0.046, pad=0.04)
+
+                        # Col 6: Weight View
+                        im5 = axes[5].imshow(w_view, cmap='jet', vmin=0, vmax=1)
+                        axes[5].set_title(f'W:View\n[{v_min:.2f}, {v_max:.2f}] μ={v_mean:.2f}')
+                        axes[5].axis('off')
+                        plt.colorbar(im5, ax=axes[5], fraction=0.046, pad=0.04)
+
+                        # Col 7: Fused Result
+                        im6 = axes[6].imshow(fused_vis, cmap='viridis')
+                        axes[6].set_title('Fused Result (Norm)')
+                        axes[6].axis('off')
+                        plt.colorbar(im6, ax=axes[6], fraction=0.046, pad=0.04)
+
+                        plt.suptitle(f'Step {self.vis_step_count}', fontsize=16)
+                        plt.tight_layout()
+                        
+                        save_path = os.path.join(save_dir, f'fusion_vis_step_{self.vis_step_count}.png')
+                        plt.savefig(save_path)
+                        plt.close()
+                # ================== VISUALIZATION END ==================
             # 用融合后的特征替换原mlvl_feats，后续流程不变
             mlvl_feats = mlvl_feats_fused
             gram_loss = gram_loss / len(mlvl_feats) * self.gram_loss_weight  #  gramloss的尝试
-    #=================================================================================================================11.08 sota模型 
-    # @force_fp32(apply_to=('mlvl_feats', 'mlvl_feats_view'))
-    # def forward(self, 
-    #             mlvl_feats, 
-    #             mlvl_feats_view=None,  # View分支特征
-    #             img_metas=None, 
-    #             ):
-    #     bs = mlvl_feats[0].shape[0]
-    #     dtype = mlvl_feats[0].dtype
-    #     gram_loss = 0.0 
-    #     if mlvl_feats_view is not None:
-    #         assert len(mlvl_feats) == len(mlvl_feats_view), "两个特征的尺度数量必须一致"
-    #         mlvl_feats_fused = []
-    #         for feat_lidar, feat_view in zip(mlvl_feats, mlvl_feats_view):
-    #             # 1. 特征平滑+重塑（保留原有逻辑）
-    #             feat_view_smoothed = self.high_res_smoothing(feat_view)
-    #             B, C, H, W = feat_lidar.shape  # 获取当前尺度的空间维度
-    #             feat_lidar_reshaped = feat_lidar.permute(0, 2, 3, 1).reshape(B, -1, 256)
-    #             feat_view_reshaped = feat_view_smoothed.permute(0, 2, 3, 1).reshape(B, -1, 256)
-                
-    #             # 2. 计算逐像素余弦相似度（reshape到空间维度）
-    #             feat_lidar_norm = F.normalize(feat_lidar_reshaped, dim=-1)
-    #             feat_view_norm = F.normalize(feat_view_reshaped, dim=-1)
-    #             cos_sim = (feat_lidar_norm * feat_view_norm).sum(dim=-1)  # (B, N)，N=H*W
-    #             cos_sim = (cos_sim + 1) / 2  # 映射到[0,1]
-    #             cos_sim = torch.clamp(cos_sim, min=0.2)  # 过滤噪点
-    #             # 关键：reshape为空间维度（B, 1, H, W），与注意力权重维度匹配
-    #             cos_sim_map = cos_sim.reshape(B, 1, H, W)  # (B, 1, H, W)，逐像素的相似度
-                
-    #             # 3. 计算原始空间注意力权重（保留原有逻辑）
-    #             concat_feat = torch.cat([feat_lidar, feat_view_smoothed], dim=1)  # (B, 512, H, W)
-    #             attn_weights = self.spatial_attn_fusion(concat_feat)  # (B, 2, H, W)：[lidar权重, view权重]
-                
-    #             # 4. 用余弦相似度修正view权重（核心优化：有效区域放大view权重，噪点区域压低）
-    #             # 先应用基础权重偏向（0.7 lidar, 0.3 view）
-    #             attn_weights = attn_weights * torch.tensor([0.7, 0.3], device=attn_weights.device).reshape(1, 2, 1, 1)
-    #             # 用cos_sim_map修正view权重：相似度越高，view权重越大（范围[0.3*0.2, 0.3*1]）
-    #             attn_weights[:, 1:2] *= cos_sim_map  # view权重 = 基础权重 * 相似度
-    #             # 重新归一化，确保lidar + view权重和为1
-    #             attn_weights = F.softmax(attn_weights, dim=1)
-                
-    #             # 5. 加权融合（保留原有逻辑）
-    #             fused = attn_weights[:, 0:1] * feat_lidar + attn_weights[:, 1:2] * feat_view_smoothed
-    #             mlvl_feats_fused.append(fused)
-                
-    #             # 6. 余弦相似度加权GramLoss（保留之前的优化）
-    #             cos_sim = cos_sim.reshape(B, -1, 1, 1)
-    #             raw_gram_loss = self.gram_loss(feat_view_reshaped, feat_lidar_reshaped)
-    #             weighted_gram_loss = raw_gram_loss * cos_sim
-    #             gram_loss += weighted_gram_loss.mean()
-            
-    #         # 最终GramLoss计算（保留原有逻辑）
-    #         gram_loss = gram_loss / len(mlvl_feats) * self.gram_loss_weight
-    #         mlvl_feats = mlvl_feats_fused
-        # -------------------------- 1. 生成原始Query Embedding --------------------------
-
-        # 提前定义嵌入维度c（确保全局可用）
-        # c = self.embed_dims
 
         # 1. 生成原始Query Embedding（确保形状为[num_query, 2c]）
         if self.query_embed_type == 'all_pts':
